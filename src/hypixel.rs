@@ -7,11 +7,15 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::now_millis;
 use crate::ratelimit::RateLimits;
+
+/// How many times one upstream call is attempted.
+const ATTEMPTS: u32 = 2;
 
 /// The profile of a player, reduced to what the mod needs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +111,27 @@ impl HypixelClient {
     }
 
     /// Fetches the profile of a player and reduces it to the slim version.
+    ///
+    /// A transient upstream failure is tried once more: Hypixel has bad moments,
+    /// and a second call is much cheaper than a `502` in the game. An answer that
+    /// will not change, like a rejected key or a player without a profile, is
+    /// returned as it is.
     pub async fn fetch_profile(&self, uuid: &str) -> Result<SlimProfile, HypixelError> {
+        let mut attempt = 1;
+        loop {
+            match self.fetch_once(uuid).await {
+                Err(error) if attempt < ATTEMPTS && error.is_transient() => {
+                    tracing::debug!(%error, attempt, "the upstream failed, trying once more");
+                    tokio::time::sleep(retry_delay()).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// One upstream call.
+    async fn fetch_once(&self, uuid: &str) -> Result<SlimProfile, HypixelError> {
         if let Some(wait) = self.limits.exhausted() {
             return Err(HypixelError::RateLimited(wait));
         }
@@ -143,6 +167,14 @@ impl HypixelClient {
             return Err(HypixelError::RateLimited(wait));
         }
 
+        // A failing upstream is not parsed: the body may not even be JSON.
+        if status.is_server_error() {
+            return Err(HypixelError::Api {
+                status: status.as_u16(),
+                cause: "the upstream is failing".to_string(),
+            });
+        }
+
         let body: Value = response.json().await.map_err(HypixelError::Request)?;
 
         let cause = body
@@ -159,6 +191,32 @@ impl HypixelClient {
 
         parse_profile(uuid, &body)
     }
+}
+
+impl HypixelError {
+    /// Whether asking again could plausibly work.
+    fn is_transient(&self) -> bool {
+        match self {
+            // A connection that did not open, a request that did not go out, or a
+            // timeout. A body that failed to decode is not retried: the answer is
+            // broken, not early.
+            Self::Request(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+            // The upstream itself is failing, not the request. A 4xx is about the
+            // key or the player and will not change in a few hundred milliseconds.
+            Self::Api { status, .. } => (500..600).contains(status),
+            // A rate limit needs a whole window, and a missing profile will not
+            // appear on a second look.
+            Self::RateLimited(_) | Self::Missing(_) => false,
+        }
+    }
+}
+
+/// How long the service waits before the second attempt. The jitter keeps two
+/// callers that failed together from retrying together.
+fn retry_delay() -> Duration {
+    let mut bytes = [0u8; 2];
+    OsRng.fill_bytes(&mut bytes);
+    Duration::from_millis(200 + u64::from(u16::from_le_bytes(bytes)) % 200)
 }
 
 /// Reads a number out of a header of the answer.
@@ -260,6 +318,13 @@ pub fn parse_mining(member: &Value) -> MiningProfile {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::Router;
 
     fn sample() -> Value {
         json!({
@@ -378,5 +443,115 @@ mod tests {
         });
         let profile = parse_profile("0123456789abcdef0123456789abcdef", &misplaced).unwrap();
         assert_eq!(profile.mining.ability, None);
+    }
+
+    /// The uuid the fake upstream tests ask for.
+    const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+
+    /// Starts a fake Hypixel that answers with the given status and body pairs,
+    /// in order, repeating the last one. Returns its base url and the number of
+    /// requests that reached it.
+    async fn fake_hypixel(answers: Vec<(StatusCode, String)>) -> (String, Arc<AtomicUsize>) {
+        type Script = (Vec<(StatusCode, String)>, Arc<AtomicUsize>);
+
+        async fn answer(State((answers, calls)): State<Script>) -> (StatusCode, String) {
+            let index = calls.fetch_add(1, Ordering::SeqCst);
+            answers[index.min(answers.len() - 1)].clone()
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v2/skyblock/profiles", get(answer))
+            .with_state((answers, calls.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the fake upstream binds");
+        let address = listener
+            .local_addr()
+            .expect("the fake upstream has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), calls)
+    }
+
+    fn client_for(base: &str) -> HypixelClient {
+        HypixelClient::new("a-test-key", base).expect("the client is built")
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_upstream_is_reported_as_a_wait_and_not_retried() {
+        let (base, calls) =
+            fake_hypixel(vec![(StatusCode::TOO_MANY_REQUESTS, "{}".to_string())]).await;
+
+        let error = client_for(&base).fetch_profile(UUID).await.unwrap_err();
+
+        assert!(
+            matches!(error, HypixelError::RateLimited(_)),
+            "the error was {error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the answer was retried");
+    }
+
+    #[tokio::test]
+    async fn a_failing_upstream_is_tried_once_more() {
+        let (base, calls) = fake_hypixel(vec![
+            (StatusCode::INTERNAL_SERVER_ERROR, "not json".to_string()),
+            (StatusCode::INTERNAL_SERVER_ERROR, "not json".to_string()),
+        ])
+        .await;
+
+        let error = client_for(&base).fetch_profile(UUID).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "api error 500: the upstream is failing");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the answer was not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_recovers_on_the_second_call_answers_the_profile() {
+        let (base, calls) = fake_hypixel(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, String::new()),
+            (StatusCode::OK, sample().to_string()),
+        ])
+        .await;
+
+        let profile = client_for(&base)
+            .fetch_profile(UUID)
+            .await
+            .expect("the second answer is good");
+
+        assert_eq!(profile.mining.perks.get("compact_mining"), Some(&3));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_is_not_retried() {
+        let cause = json!({ "success": false, "cause": "Invalid API key" }).to_string();
+        let (base, calls) = fake_hypixel(vec![(StatusCode::FORBIDDEN, cause)]).await;
+
+        let error = client_for(&base).fetch_profile(UUID).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "api error 403: Invalid API key");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the answer was retried");
+    }
+
+    #[tokio::test]
+    async fn a_player_without_a_profile_is_not_retried() {
+        let body = json!({
+            "success": true,
+            "profiles": [{ "selected": true, "members": {} }]
+        })
+        .to_string();
+        let (base, calls) = fake_hypixel(vec![(StatusCode::OK, body)]).await;
+
+        let error = client_for(&base).fetch_profile(UUID).await.unwrap_err();
+
+        assert!(matches!(error, HypixelError::Missing("member")));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the answer was retried");
     }
 }
