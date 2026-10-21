@@ -55,6 +55,11 @@ traffic. This file is the source of truth for what is done and what is next; see
       rewritten before the first push to drop a development
       `SKYATLAZ_TOKEN_SECRET` that had been committed in an environment
       template; the value had already been rotated and no deployment used it.
+- [x] Tagged release artifacts: static musl binaries for x86_64 (the runner's own
+      compiler) and aarch64 (through `cross`, because Ubuntu's aarch64 gcc is a
+      glibc compiler and `ring` cannot compile its C for a musl target with it),
+      a `SHA256SUMS`, and a check that both binaries really are static before
+      they are published. `v0.1.0` exercised the job end to end.
 
 ## Measurements
 
@@ -125,17 +130,11 @@ regression of more than 2× in the cached path is a bug.
 3. **The rest of the supply chain check.** The weekly job runs `cargo audit` for
    advisories now. `cargo deny` would add licences and duplicate crates; add it to
    the same workflow when there is time to triage the first report.
-4. **Prove the release job.** `.github/workflows/release.yml` builds the two musl
-   tarballs, their checksums and the release notes on a `v*` tag, but no tag has
-   been pushed, so nothing has exercised it yet.
-   *Done when:* a tag produces a release with both artifacts, `sha256sum --check`
-   passes on a downloaded one, and the binary runs on a clean VM without a Rust
-   toolchain.
-5. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
+4. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
    `parse_mining`. Both consume untrusted JSON that changes without notice.
-6. **Split liveness and readiness** if a load balancer is added: `/health` stays
+5. **Split liveness and readiness** if a load balancer is added: `/health` stays
    dependency free, `/ready` can report whether the upstream is usable.
-7. **Turn on private vulnerability reporting if the repository goes public.**
+6. **Turn on private vulnerability reporting if the repository goes public.**
    `SECURITY.md` points at the Security tab, and GitHub refuses the feature while
    the repository is private: `PUT .../private-vulnerability-reporting` answers
    `404`.

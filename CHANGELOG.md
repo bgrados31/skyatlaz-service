@@ -26,7 +26,6 @@ release. Each section says what the mod has to do about it.
 
 - A cache miss is not deduplicated: two requests for the same player in the same
   instant both call Hypixel.
-- No prebuilt binary is published yet for a tag; see `docs/ROADMAP.md`.
 
 ## [0.1.0] - 2026-10-21
 
@@ -73,6 +72,9 @@ reads their own SkyBlock profile, while the Hypixel key stays in the service.
 - **Deployment material**: a systemd unit, a Caddyfile that terminates TLS and
   answers a public `/metrics` with `404`, an environment template and a runbook
   for an Oracle Cloud Always Free instance.
+- **A tagged release publishes both Linux artifacts**: static musl binaries for
+  `x86_64` and `aarch64`, a `SHA256SUMS` and the deploy pointer, so a deploy is
+  a download instead of a compile on a small VM.
 
 ### Security
 

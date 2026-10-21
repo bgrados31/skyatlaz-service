@@ -259,9 +259,10 @@ the checks to run before sharing the url.
 scp target/release/skyatlaz-service server:/tmp/
 ```
 
-A tagged release also builds `skyatlaz-service-{x86_64,aarch64}-unknown-linux-musl`
-tarballs with checksums (`.github/workflows/release.yml`), so a deploy is a
-download instead of a five minute compile on a small VM.
+A tagged release publishes `skyatlaz-service-{x86_64,aarch64}-unknown-linux-musl`
+tarballs with a `SHA256SUMS` (`.github/workflows/release.yml`, exercised by
+`v0.1.0`), so a deploy is a download instead of a five minute compile on a small
+VM.
 
 ## The contract
 
@@ -295,10 +296,11 @@ the setup, the style rules and the checklist a change has to pass;
 ## Status
 
 Working and used locally with the mod: authentication, cache, rate limit
-handling, retry, metrics and the deployment runbook are done. Not yet in
+handling, retry, metrics, the deployment runbook and the tagged release are
+done, and `v0.1.0` is the first release with prebuilt binaries. Not yet in
 production on a public url. What is left is in
 [`docs/ROADMAP.md`](docs/ROADMAP.md), and the biggest items are single-flight on
-cache misses, a prebuilt release and a fuzzed parser.
+cache misses and a fuzzed parser.
 
 ## License
 
