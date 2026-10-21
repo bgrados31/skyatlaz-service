@@ -86,6 +86,21 @@ release notes when it is fixed.
   ([`.github/workflows/audit.yml`](.github/workflows/audit.yml)). A vulnerable
   dependency is a release blocker.
 
+## Known advisories that do not apply
+
+`cargo audit` reports [RUSTSEC-2023-0071][marvin] (the "Marvin attack") against
+`rsa` 0.9.10, and the advisory has no patch: it is about a **private** key
+leaking through timing while signing or decrypting. This service does neither.
+It calls `VerifyingKey::verify` on a public key it parsed from the request
+(`src/keys.rs`) and it signs nothing outside its own tests, so the process holds
+no private key to leak and an attacker has no measurement to make.
+
+The advisory is ignored in [`.cargo/audit.toml`](.cargo/audit.toml), where the
+same reason is written next to it. Remove that line if a private key ever
+enters the process, and check again when `rsa` becomes constant time.
+
+[marvin]: https://rustsec.org/advisories/RUSTSEC-2023-0071.html
+
 The long version of the design and its failure modes is in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the invariants that must never be
 broken are in [`AGENTS.md`](AGENTS.md).
