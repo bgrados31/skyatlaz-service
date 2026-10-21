@@ -105,8 +105,25 @@ mod tests {
     use rsa::pkcs8::EncodePublicKey;
     use rsa::RsaPrivateKey;
     use sha2::Digest;
+    use std::sync::OnceLock;
 
-    fn test_key() -> (RsaPrivateKey, Vec<u8>) {
+    /// The key pair the whole suite shares.
+    ///
+    /// Generating a 2048-bit RSA key costs more than every other test in this
+    /// binary together, and no test needs a private key of its own, so one pair
+    /// is generated per test binary instead of one per test.
+    fn test_key() -> &'static (RsaPrivateKey, Vec<u8>) {
+        static KEY: OnceLock<(RsaPrivateKey, Vec<u8>)> = OnceLock::new();
+        KEY.get_or_init(generate_key)
+    }
+
+    /// A second pair, for the tests that need a key that must not match.
+    fn other_key() -> &'static (RsaPrivateKey, Vec<u8>) {
+        static KEY: OnceLock<(RsaPrivateKey, Vec<u8>)> = OnceLock::new();
+        KEY.get_or_init(generate_key)
+    }
+
+    fn generate_key() -> (RsaPrivateKey, Vec<u8>) {
         let private = RsaPrivateKey::new(&mut OsRng, 2048).expect("key");
         let der = private
             .to_public_key()
@@ -125,20 +142,20 @@ mod tests {
         let signature = private
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
             .expect("sign");
-        assert!(verify_sha256(&der, &signature, payload));
-        assert!(!verify_sha256(&der, &signature, b"other"));
+        assert!(verify_sha256(der, &signature, payload));
+        assert!(!verify_sha256(der, &signature, b"other"));
     }
 
     #[test]
     fn rejects_a_wrong_public_key() {
         let (private, _) = test_key();
-        let (_, other_der) = test_key();
+        let (_, other_der) = other_key();
         let payload = b"the nonce";
         let digest = Sha256::digest(payload);
         let signature = private
             .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
             .expect("sign");
-        assert!(!verify_sha256(&other_der, &signature, payload));
+        assert!(!verify_sha256(other_der, &signature, payload));
     }
 
     #[test]
@@ -146,13 +163,13 @@ mod tests {
         let (private, der) = test_key();
         let uuid = Uuid::new_v4();
         let expires_at = 1_700_000_000_000_i64;
-        let payload = mojang_signed_payload(&uuid, expires_at, &der);
+        let payload = mojang_signed_payload(&uuid, expires_at, der);
         let digest = Sha1::digest(&payload);
         let signature = private
             .sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
             .expect("sign");
         assert!(verify_mojang_key_signature(
-            &uuid, expires_at, &der, &signature
+            &uuid, expires_at, der, &signature
         ));
     }
 
@@ -162,13 +179,13 @@ mod tests {
         let uuid = Uuid::new_v4();
         let other = Uuid::new_v4();
         let expires_at = 1_700_000_000_000_i64;
-        let payload = mojang_signed_payload(&uuid, expires_at, &der);
+        let payload = mojang_signed_payload(&uuid, expires_at, der);
         let digest = Sha1::digest(&payload);
         let signature = private
             .sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
             .expect("sign");
         assert!(!verify_mojang_key_signature(
-            &other, expires_at, &der, &signature
+            &other, expires_at, der, &signature
         ));
     }
 }
