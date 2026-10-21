@@ -17,6 +17,10 @@ vulnerability** on
 <https://github.com/bgrados31/skyatlaz-service/security/advisories/new>.
 
 - **Do not open a public issue for a vulnerability.**
+- If there is no **Report a vulnerability** button (GitHub only offers it on
+  public repositories), message the maintainer from their
+  [GitHub profile](https://github.com/bgrados31) with a one line note and no
+  details, and a private channel is opened from there.
 - **Never paste a key, a session token, a nonce, a signature or a whole
   `Authorization` header** into an issue, a log, a screenshot or this repository.
   If you already did, rotate the Hypixel key at
