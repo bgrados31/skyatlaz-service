@@ -1,0 +1,68 @@
+name: release
+
+# A deploy on a small VM should be a download, not a five minute compile.
+# Both targets are static musl builds so the same tarball runs on any Linux.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release:
+    name: build and publish the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install the pinned toolchain and the targets
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools gcc-aarch64-linux-gnu
+
+      - name: build x86_64-unknown-linux-musl
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: build aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target aarch64-unknown-linux-musl
+
+      - name: package
+        run: |
+          set -eu
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            tar -czf "skyatlaz-service-${target}.tar.gz" \
+              -C "target/${target}/release" skyatlaz-service
+          done
+          sha256sum skyatlaz-service-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            skyatlaz-service-x86_64-unknown-linux-musl.tar.gz
+            skyatlaz-service-aarch64-unknown-linux-musl.tar.gz
+            SHA256SUMS
+          generate_release_notes: true
+          body: |
+            Static Linux builds of `skyatlaz-service`, with checksums.
+
+            ```bash
+            sha256sum --check SHA256SUMS
+            tar -xzf skyatlaz-service-x86_64-unknown-linux-musl.tar.gz
+            ```
+
+            The environment variables, the systemd unit and the Caddyfile are in
+            [`deploy/README.md`](https://github.com/bgrados31/skyatlaz-service/blob/main/deploy/README.md).
+            New here? Read the [changelog](https://github.com/bgrados31/skyatlaz-service/blob/main/CHANGELOG.md) first.
