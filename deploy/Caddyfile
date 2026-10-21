@@ -1,0 +1,25 @@
+# Caddyfile for the SkyAtlaz service.
+#
+# Replace the host with the name that resolves to the instance, either a
+# domain you own or the sslip.io name for the public IP:
+#   skyatlaz.example.com { ... }
+#   203.0.113.10.sslip.io { ... }
+#
+# Caddy asks Let's Encrypt for a certificate on first request, so port 80
+# has to be reachable from the internet.
+
+skyatlaz.example.com {
+	reverse_proxy 127.0.0.1:8080
+
+	# The service has its own authentication. Do not log the bearer tokens.
+	log {
+		output file /var/log/caddy/skyatlaz-service.log
+		format json
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}

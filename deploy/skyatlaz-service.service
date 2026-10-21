@@ -1,0 +1,29 @@
+[Unit]
+Description=SkyAtlaz profile service
+Documentation=https://github.com/tnozamas/SkyAtlaz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skyatlaz
+Group=skyatlaz
+WorkingDirectory=/opt/skyatlaz-service
+EnvironmentFile=/etc/skyatlaz-service.env
+ExecStart=/opt/skyatlaz-service/skyatlaz-service
+Restart=always
+RestartSec=5
+
+# The service only needs to listen on localhost and talk to the Hypixel API.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
