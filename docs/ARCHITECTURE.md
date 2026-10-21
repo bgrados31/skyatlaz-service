@@ -122,7 +122,10 @@ the cache.
   flight only stays in the table while a request is waiting on it: a finished
   flight removes its own entry, and the next lookup drops the entries that a
   cancelled or timed-out flight left behind. A leader cancelled by the request
-  timeout drops its guard, one waiter takes over and the uuid is not wedged. The
+  timeout drops its guard, one waiter takes over and the uuid is not wedged. If
+  the upstream itself hangs, that happens once per waiter: each takeover starts a
+  fresh call until the waiter's own request timeout ends it too, so the calls stay
+  sequential and nobody is answered from a flight that is already gone. The
   table is capped at `MAX_IN_FLIGHT_PROFILES` (1 024); past the cap a request
   fetches on its own instead of evicting a flight somebody is waiting on, so the
   bound costs coalescing and never correctness.

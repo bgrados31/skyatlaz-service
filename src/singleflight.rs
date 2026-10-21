@@ -298,6 +298,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_waiter_takes_over_when_the_leader_is_cancelled() {
+        let flights = Arc::new(SingleFlight::<u32, &'static str>::new(8));
+        let entered = Arc::new(Notify::new());
+
+        let leader = tokio::spawn({
+            let flights = Arc::clone(&flights);
+            let entered = Arc::clone(&entered);
+            async move {
+                flights
+                    .run("uuid", || async move {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                        Ok(1u32)
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+
+        // Poll the second caller once while the leader still holds the guard, so
+        // it is queued on the flight instead of starting after it is gone.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let follower_calls = Arc::clone(&calls);
+        let follower = flights.run("uuid", move || async move {
+            follower_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(2u32)
+        });
+        tokio::pin!(follower);
+        std::future::poll_fn(|context| {
+            let _ = follower.as_mut().poll(context);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        leader.abort();
+        assert!(leader.await.is_err(), "the leader did not stop");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut follower)
+            .await
+            .expect("the waiter did not take over");
+        assert_eq!(*result.as_ref(), Ok(2u32));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(flights.len(), 0, "the flight stayed in the table");
+    }
+
+    #[tokio::test]
     async fn the_table_is_bounded_and_forgets_finished_flights() {
         let flights = Arc::new(SingleFlight::<u32, &'static str>::new(2));
         let (entered, mut started) = mpsc::channel(4);

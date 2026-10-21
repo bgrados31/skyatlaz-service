@@ -46,7 +46,7 @@ traffic. This file is the source of truth for what is done and what is next; see
       fetches by outcome, retries, and three gauges. Fixed label sets, atomics
       only, no new dependency, and refused from the internet in the Caddyfile.
 - [x] HTTP tests through the real router (`oneshot`), contract tests, and unit
-      tests for every new rule: 75 tests, no network.
+      tests for every new rule: 76 tests, no network.
 - [x] One RSA key pair per test binary (`OnceLock`) instead of one per test,
       which took the suite from about 45 s to under 5 s in a debug build.
 - [x] CI (fmt, clippy `-D warnings`, tests on Linux and Windows, release build),
