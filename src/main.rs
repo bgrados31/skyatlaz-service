@@ -13,6 +13,7 @@ mod hypixel;
 mod keys;
 mod metrics;
 mod ratelimit;
+mod singleflight;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use crate::cache::TtlCache;
 use crate::config::Config;
 use crate::hypixel::{HypixelClient, HypixelError, SlimProfile};
 use crate::metrics::{Metrics, Route, Values};
+use crate::singleflight::SingleFlight;
 
 /// The contract of the service, so a client can be written against it.
 const OPENAPI: &str = include_str!("../openapi.json");
@@ -53,6 +55,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// type of an exposition.
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
+/// How many profile fetches may be in progress at once. Each entry is one player
+/// with an upstream call the service is waiting for, so the default covers the
+/// connections a single instance serves at the same time. Past it a request asks
+/// the upstream on its own instead of joining a flight it cannot reach, which
+/// keeps the table bounded without tuning another environment variable.
+const MAX_IN_FLIGHT_PROFILES: usize = 1_024;
+
 /// Everything the handlers need.
 pub struct AppState {
     /// The authentication service.
@@ -61,6 +70,9 @@ pub struct AppState {
     pub hypixel: HypixelClient,
     /// The cached profiles.
     pub profiles: TtlCache<String, SlimProfile>,
+    /// The profile fetches in progress, so concurrent misses for one player cost
+    /// one upstream call instead of one each.
+    pub flights: SingleFlight<SlimProfile, HypixelError>,
     /// The counters served at `/metrics`.
     pub metrics: Arc<Metrics>,
 }
@@ -146,9 +158,12 @@ impl ApiError {
     }
 
     /// Turns a client failure into an answer the mod can act on.
-    fn from_hypixel(error: HypixelError) -> Self {
+    ///
+    /// Takes a reference so the one failure of a shared upstream call can be
+    /// turned into an answer for every request that waited for it.
+    fn from_hypixel(error: &HypixelError) -> Self {
         match error {
-            HypixelError::RateLimited(wait) => Self::unavailable(wait),
+            HypixelError::RateLimited(wait) => Self::unavailable(*wait),
             HypixelError::Missing(field) => {
                 tracing::debug!(field, "the player has no profile the service can read");
                 Self::profile_not_found()
@@ -306,6 +321,12 @@ async fn verify(
 }
 
 /// Returns the profile of the caller.
+///
+/// A cache miss joins the single flight of the uuid: the first request calls
+/// Hypixel and the rest wait for that answer instead of spending the rate limit
+/// once each. The flight shares failures too, and the cache lookup is repeated
+/// inside it because a flight that finished between the miss and this point has
+/// already stored the profile.
 async fn profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -323,13 +344,22 @@ async fn profile(
     }
     state.metrics.cache_miss();
 
-    let profile = state
-        .hypixel
-        .fetch_profile(&uuid)
-        .await
-        .map_err(ApiError::from_hypixel)?;
-    state.profiles.insert(uuid, profile.clone());
-    Ok(Json(profile))
+    let outcome = state
+        .flights
+        .run(&uuid, || async {
+            if let Some(cached) = state.profiles.get(&uuid) {
+                return Ok(cached);
+            }
+            let profile = state.hypixel.fetch_profile(&uuid).await?;
+            state.profiles.insert(uuid.clone(), profile.clone());
+            Ok(profile)
+        })
+        .await;
+
+    match &*outcome {
+        Ok(profile) => Ok(Json(profile.clone())),
+        Err(error) => Err(ApiError::from_hypixel(error)),
+    }
 }
 
 /// Reads the bearer token out of the headers. The scheme is case insensitive
@@ -445,6 +475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hypixel: HypixelClient::new(&config.hypixel_api_key, &config.hypixel_base)?
             .with_metrics(Arc::clone(&metrics)),
         profiles: TtlCache::new(config.profile_ttl, config.profile_cache_entries),
+        flights: SingleFlight::new(MAX_IN_FLIGHT_PROFILES),
         metrics,
     });
 
@@ -471,6 +502,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
     use crate::hypixel::MiningProfile;
@@ -486,6 +518,7 @@ mod tests {
                 .expect("the client is built")
                 .with_metrics(Arc::clone(&metrics)),
             profiles: TtlCache::new(Duration::from_secs(60), 8),
+            flights: SingleFlight::new(8),
             metrics,
         })
     }
@@ -541,6 +574,47 @@ mod tests {
             currencies: serde_json::Value::Null,
             fetched_at: 0,
         }
+    }
+
+    /// Starts a fake Hypixel that answers the profile of `uuid` after a short
+    /// delay, so the requests a test starts together are all inside the handler
+    /// at once, and counts the calls that reach it.
+    async fn fake_upstream(uuid: &str) -> (String, Arc<AtomicUsize>) {
+        type Script = (String, Arc<AtomicUsize>);
+
+        async fn answer(State((body, calls)): State<Script>) -> (StatusCode, String) {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            (StatusCode::OK, body)
+        }
+
+        let mut members = serde_json::Map::new();
+        members.insert(
+            uuid.replace('-', ""),
+            serde_json::json!({ "currencies": { "coin": 1 } }),
+        );
+        let body = serde_json::json!({
+            "success": true,
+            "profiles": [{ "selected": true, "members": members }]
+        })
+        .to_string();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let upstream = Router::new()
+            // The test module has its own `get` for building requests.
+            .route("/v2/skyblock/profiles", axum::routing::get(answer))
+            .with_state((body, Arc::clone(&calls)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the fake upstream binds");
+        let address = listener
+            .local_addr()
+            .expect("the fake upstream has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        (format!("http://{address}"), calls)
     }
 
     /// A request that carries a bearer token.
@@ -732,6 +806,61 @@ mod tests {
         );
         // The connection was refused, which is worth a second attempt.
         assert!(body.contains("skyatlaz_upstream_retries_total 1"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn fifty_concurrent_requests_for_one_player_make_one_upstream_call() {
+        let uuid = uuid::Uuid::new_v4();
+        let (base, upstream_calls) = fake_upstream(&uuid.to_string()).await;
+
+        let metrics = Arc::new(Metrics::new());
+        let state = Arc::new(AppState {
+            auth: AuthService::new(
+                b"a-test-secret-that-is-long-enough".to_vec(),
+                Duration::from_secs(3600),
+            ),
+            hypixel: HypixelClient::new("a-test-key", &base)
+                .expect("the client is built")
+                .with_metrics(Arc::clone(&metrics)),
+            profiles: TtlCache::new(Duration::from_secs(60), 8),
+            flights: SingleFlight::new(8),
+            metrics,
+        });
+        let router = app(Arc::clone(&state));
+        let token = state
+            .auth
+            .issue_token(&uuid, crate::auth::now_millis() + 60_000);
+
+        let mut requests = Vec::new();
+        for _ in 0..50 {
+            let router = router.clone();
+            let request = authorized("/v1/profile", &token);
+            requests.push(tokio::spawn(
+                async move { send_with(&router, request).await },
+            ));
+        }
+
+        let mut answers = Vec::new();
+        for request in requests {
+            answers.push(request.await.expect("the request finishes"));
+        }
+
+        for (status, _, body) in &answers {
+            assert_eq!(*status, StatusCode::OK, "a caller did not get an answer");
+            assert_eq!(
+                body["uuid"],
+                uuid.to_string(),
+                "a caller got another player's profile"
+            );
+        }
+        // The one upstream answer fills the cache and is shared with the rest of
+        // the callers, so the key is spent once for fifty requests.
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            1,
+            "the upstream was called once per request"
+        );
+        assert_eq!(state.profiles.len(), 1);
     }
 
     #[tokio::test]

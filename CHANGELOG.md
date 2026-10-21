@@ -11,6 +11,11 @@ release. Each section says what the mod has to do about it.
 
 ### Added
 
+- Concurrent cache misses for the same player are coalesced. The first request
+  calls Hypixel and the rest wait for that one answer, success or failure, so a
+  burst of fifty clients costs the key one request. The table of flights is
+  bounded and holds weak references: a finished flight removes its entry, and the
+  next lookup drops the one a cancelled request left behind.
 - A weekly `cargo audit` job, so a crate that gains an advisory shows up as an
   issue even when nothing in this repository changed.
 
@@ -21,11 +26,6 @@ release. Each section says what the mod has to do about it.
   and never signs, so it holds no private key to leak. The reason is written
   next to the ignore in `.cargo/audit.toml` and in `SECURITY.md`, so the entry
   cannot be mistaken for noise.
-
-### Known gaps
-
-- A cache miss is not deduplicated: two requests for the same player in the same
-  instant both call Hypixel.
 
 ## [0.1.0] - 2026-10-21
 

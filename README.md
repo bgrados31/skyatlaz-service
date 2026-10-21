@@ -54,6 +54,10 @@ database or second process to keep alive.
 - **A slim profile, not the whole answer.** The upstream profile is about 1 MB;
   the service keeps the mining tree, the dungeons and the currencies, so the
   cache and the game traffic stay small.
+- **One upstream call per player at a time.** Concurrent cache misses for the
+  same player share a flight: the first request asks Hypixel and the rest wait
+  for that answer, success or failure. A burst of fifty clients costs one
+  request of the key.
 - **Bounded everything.** The profile cache and the nonce store have hard caps,
   the per-address challenge limit has a capped table of addresses, the body limit
   and the timeouts are fixed. Memory is a function of configuration, not traffic.
@@ -162,7 +166,7 @@ sequenceDiagram
     Mod->>Service: GET /v1/profile (Bearer token)
     Service->>Hypixel: GET /v2/skyblock/profiles?uuid=…
     Hypixel-->>Service: ~1 MB profile
-    Service->>Service: reduce it, then cache it for 5 minutes
+    Service->>Service: reduce it, then cache it for 5 minutes (concurrent misses share this call)
     Service-->>Mod: slim profile
 ```
 
@@ -200,6 +204,7 @@ message names the variable and the value it read.
 | Upstream requests | 120 per 5 minutes (a personal key; some advertise 300) | The cache TTL is the throttle. |
 | Profile TTL | 300 s → at most 12 upstream requests per player per hour | ~120 players served continuously by one key. |
 | Cache | 1 024 entries by default, 100 000 hard cap | Tens of megabytes at the default. |
+| In-flight profile calls | 1 024 uuids, weak entries | Concurrent misses for one player share one upstream call; a finished flight removes itself and a cancelled one is dropped by the next lookup. |
 | Nonce store | 10 000 entries, single use, expired ones dropped | The endpoint is unauthenticated. |
 | Challenge rate | 30 per address per minute, 10 000 addresses tracked | One address cannot flood it; the table is capped. |
 | Request body | 64 KiB | A verify request is about 1 KiB. |
@@ -295,12 +300,11 @@ the setup, the style rules and the checklist a change has to pass;
 
 ## Status
 
-Working and used locally with the mod: authentication, cache, rate limit
-handling, retry, metrics, the deployment runbook and the tagged release are
-done, and `v0.1.0` is the first release with prebuilt binaries. Not yet in
-production on a public url. What is left is in
-[`docs/ROADMAP.md`](docs/ROADMAP.md), and the biggest items are single-flight on
-cache misses and a fuzzed parser.
+Working and used locally with the mod: authentication, cache, single-flight,
+rate limit handling, retry, metrics, the deployment runbook and the tagged
+release are done, and `v0.1.0` is the first release with prebuilt binaries. Not
+yet in production on a public url. What is left is in
+[`docs/ROADMAP.md`](docs/ROADMAP.md), and the biggest item is a fuzzed parser.
 
 ## License
 
