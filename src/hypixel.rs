@@ -132,6 +132,17 @@ impl HypixelClient {
             header_number(&headers, "ratelimit-reset"),
         );
 
+        // A 429 means the window is used up even when the headers did not say
+        // so. Reporting it as a wait lets the handler answer with Retry-After
+        // instead of a bare bad gateway.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = self
+                .limits
+                .exhausted()
+                .unwrap_or_else(|| Duration::from_secs(60));
+            return Err(HypixelError::RateLimited(wait));
+        }
+
         let body: Value = response.json().await.map_err(HypixelError::Request)?;
 
         let cause = body
@@ -151,10 +162,7 @@ impl HypixelClient {
 }
 
 /// Reads a number out of a header of the answer.
-fn header_number(
-    headers: &reqwest::header::HeaderMap,
-    name: &str,
-) -> Option<u64> {
+fn header_number(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
     headers.get(name)?.to_str().ok()?.parse().ok()
 }
 
@@ -337,8 +345,7 @@ mod tests {
                 }
             ]
         });
-        let profile =
-            parse_profile("0123456789abcdef0123456789abcdef", &two_islands).unwrap();
+        let profile = parse_profile("0123456789abcdef0123456789abcdef", &two_islands).unwrap();
         assert_eq!(profile.currencies["coin"], 2);
     }
 
@@ -351,8 +358,7 @@ mod tests {
                 { "members": { "0123456789abcdef0123456789abcdef": { "currencies": { "coin": 2 } } } }
             ]
         });
-        let profile =
-            parse_profile("0123456789abcdef0123456789abcdef", &none_selected).unwrap();
+        let profile = parse_profile("0123456789abcdef0123456789abcdef", &none_selected).unwrap();
         assert_eq!(profile.currencies["coin"], 1);
     }
 
@@ -370,8 +376,7 @@ mod tests {
                 }
             }]
         });
-        let profile =
-            parse_profile("0123456789abcdef0123456789abcdef", &misplaced).unwrap();
+        let profile = parse_profile("0123456789abcdef0123456789abcdef", &misplaced).unwrap();
         assert_eq!(profile.mining.ability, None);
     }
 }

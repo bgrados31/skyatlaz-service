@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Runtime and dev dependencies. Grouped so a week of patch releases is one
+  # pull request, not fifteen.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      rust:
+        patterns: ["*"]
+
+  # Actions used by the workflow above.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

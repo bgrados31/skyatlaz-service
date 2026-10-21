@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Self-hosted Hypixel API proxy for the SkyAtlaz Minecraft mod"
 license = "MIT"
+publish = false
 
 [dependencies]
 axum = "0.8"
@@ -22,10 +23,29 @@ uuid = { version = "1", features = ["v4"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["set-header", "timeout", "trace"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
+# The service runs on a free ARM VM: a small binary means a fast deploy, while
+# a single codegen unit and fat LTO give the best runtime of that size budget.
 opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+# Aborting keeps the binary small. It also means no code may rely on
+# catch_unwind, see AGENTS.md.
 panic = "abort"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# The code reads like prose on purpose (see AGENTS.md); these lints punish that.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

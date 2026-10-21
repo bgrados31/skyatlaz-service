@@ -1,0 +1,5 @@
+# rustfmt decides formatting; clippy decides lints. Both run in CI and in the
+# definition of done, so do not hand-format around them.
+edition = "2021"
+newline_style = "Unix"
+use_field_init_shorthand = true

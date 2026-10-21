@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so that local builds, CI and the container image agree bit for bit.
+# Bump it in its own commit after the whole matrix passes (see AGENTS.md).
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
