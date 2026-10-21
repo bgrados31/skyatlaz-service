@@ -38,15 +38,21 @@ jobs:
           rustup target add --toolchain "$CHANNEL" \
             x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # `cross` builds inside a container image that carries the musl cross
+      # toolchain for the foreign architecture. Ubuntu's aarch64-linux-gnu gcc is
+      # a glibc compiler: `ring` compiles its C against the host headers and the
+      # link fails on a musl target, which is how the first release run died.
+      # The host architecture does not need it.
+      - name: install cross
+        uses: taiki-e/install-action@cross
 
       - name: build x86_64-unknown-linux-musl
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: build aarch64-unknown-linux-musl
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target aarch64-unknown-linux-musl
+        run: cross build --release --locked --target aarch64-unknown-linux-musl
 
       # "Static" is the promise of these artifacts: nothing to install on the
       # server. A glibc-linked binary would still run here and fail on a musl
