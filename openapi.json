@@ -165,6 +165,14 @@
               }
             }
           },
+          "502": {
+            "description": "The Hypixel API could not be read: a 5xx, a network error, a timeout or an answer that is not the expected JSON. The cause is logged, not returned.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
           "503": {
             "description": "The key used up its Hypixel rate limit. The answer carries Retry-After with the seconds to wait.",
             "headers": {

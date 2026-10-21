@@ -19,6 +19,11 @@ use crate::ratelimit::RateLimits;
 /// How many times one upstream call is attempted.
 const ATTEMPTS: u32 = 2;
 
+/// How long the client waits for Hypixel. Shorter than the request timeout in
+/// `main`, so a stuck upstream is reported as a bad gateway with the cause in
+/// the log instead of as a bare request timeout at the edge.
+pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The profile of a player, reduced to what the mod needs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlimProfile {
@@ -97,9 +102,28 @@ pub struct HypixelClient {
 impl HypixelClient {
     /// Creates the client. The API key never leaves the service.
     pub fn new(api_key: &str, base: &str) -> Result<Self, reqwest::Error> {
+        Self::build(api_key, base, UPSTREAM_TIMEOUT)
+    }
+
+    /// The same client with an explicit timeout.
+    ///
+    /// Production always goes through [`HypixelClient::new`], which applies the
+    /// 20 s budget. The router tests need a slow upstream to be cut short in
+    /// milliseconds, and relaxing the production timeout to get there would be
+    /// a bug (see `AGENTS.md`, section 10).
+    #[cfg(test)]
+    pub(crate) fn with_timeout(
+        api_key: &str,
+        base: &str,
+        timeout: Duration,
+    ) -> Result<Self, reqwest::Error> {
+        Self::build(api_key, base, timeout)
+    }
+
+    fn build(api_key: &str, base: &str, timeout: Duration) -> Result<Self, reqwest::Error> {
         let http = reqwest::Client::builder()
             .user_agent("skyatlaz-service/0.1")
-            .timeout(Duration::from_secs(20))
+            .timeout(timeout)
             .build()?;
         Ok(Self {
             http,
@@ -585,5 +609,14 @@ mod tests {
 
         assert!(matches!(error, HypixelError::Missing("member")));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the answer was retried");
+    }
+
+    #[test]
+    fn the_client_timeout_is_shorter_than_the_request_timeout() {
+        // Both numbers are documented in AGENTS.md, section 6. The order is what
+        // lets the client report a stuck upstream before the router gives up.
+        assert_eq!(UPSTREAM_TIMEOUT, Duration::from_secs(20));
+        assert_eq!(crate::REQUEST_TIMEOUT, Duration::from_secs(30));
+        assert!(UPSTREAM_TIMEOUT < crate::REQUEST_TIMEOUT);
     }
 }

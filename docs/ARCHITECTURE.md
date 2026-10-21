@@ -92,7 +92,8 @@ checks the expiry, and takes the uuid **from the token**. Then:
    a profile, so those are returned at once. The whole upstream call, both
    attempts included, is bounded by the 20 s upstream timeout and the 30 s
    request timeout; a retry after a timeout can therefore be cut short by the
-   latter.
+   latter. A body that is not JSON also ends the fetch where it is: the answer is
+   broken, not early, and a second call would only spend the key again.
 4. The response is parsed into `SlimProfile` and cached under the uuid.
 
 The raw upstream profile is about a megabyte. Only the mining tree, dungeons and
@@ -145,7 +146,7 @@ The release binary is 2.4 MB stripped and links no OpenSSL. The cold answer is
 | Unknown or reused nonce | `401 unauthorized` | Single use; the error does not say whether it existed. |
 | Player has no SkyBlock profile | `404 profile_not_found` | `HypixelError::Missing`. |
 | Hypixel rate limit used up | `503 rate_limited` + `Retry-After` | Client should wait, not retry immediately. |
-| Hypixel 5xx, network error, bad key | `502 upstream_error` | A `5xx` and a network error are tried once more first; a bad key is not. The cause is logged, not returned. |
+| Hypixel 5xx, network error, bad key, a body that is not JSON, a timeout | `502 upstream_error` | A `5xx`, a network error and a timeout are tried once more first; a bad key and a body that does not parse are not, because a second look cannot fix them. The cause is logged, not returned. Covered end to end through the router with `oneshot` against a fake upstream. |
 | Body over 64 KiB | `413 Payload Too Large` | Rejected before the handler. |
 | Request over 30 s | `408 Request Timeout` | Not expected for a healthy upstream. |
 | Panic | Process abort | `panic = "abort"`; systemd restarts it. |

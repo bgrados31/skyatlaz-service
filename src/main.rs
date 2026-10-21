@@ -614,6 +614,19 @@ mod tests {
     }
 
     #[test]
+    fn the_contract_mentions_the_upstream_failure_answer() {
+        let contract = contract();
+        let profile = &contract["paths"]["/v1/profile"]["get"]["responses"];
+
+        assert!(profile["502"].is_object(), "the contract misses a 502");
+        assert_eq!(
+            profile["502"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Error",
+            "a 502 has to carry the same error body as the other failures"
+        );
+    }
+
+    #[test]
     fn the_contract_mentions_the_challenge_limit() {
         let contract = contract();
         let challenge = &contract["paths"]["/v1/auth/challenge"]["get"]["responses"];
@@ -937,5 +950,262 @@ mod tests {
 
         headers.insert(header::AUTHORIZATION, "Bearer   ".parse().unwrap());
         assert_eq!(bearer_token(&headers), None);
+    }
+
+    /// The whole router against a broken or slow upstream.
+    ///
+    /// `hypixel.rs` covers what the client does with a bad answer. What was
+    /// missing is the same answer seen by a client of this service: a real
+    /// `oneshot` request through every layer, with the upstream on a loopback
+    /// port, has to end as a `502 upstream_error` with a JSON body and must not
+    /// turn a broken body into a second upstream call.
+    ///
+    /// The block is self contained on purpose: it only adds a helper and tests,
+    /// so it does not collide with work on the cache or the profile handler.
+    mod upstream_failure_tests {
+        use super::*;
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use serde_json::json;
+
+        use crate::hypixel::UPSTREAM_TIMEOUT;
+
+        /// The uuid the router derives from the token and asks the upstream for.
+        const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+
+        /// What the fake Hypixel does before it answers.
+        #[derive(Clone)]
+        enum Behaviour {
+            /// A 200 whose body is not JSON at all.
+            NotJson,
+            /// A 200 with the first bytes of a JSON document and no end.
+            Truncated,
+            /// A 200 with a well formed answer that does not contain the player.
+            MissingMember,
+            /// A 404 with a well formed profile body: the upstream path moved.
+            MissingResource,
+            /// A well formed answer, answered at once.
+            Valid,
+            /// A well formed answer, after a stall.
+            Slow(Duration),
+        }
+
+        /// A valid profile answer for `UUID`, so a successful fetch parses.
+        fn valid_profile() -> String {
+            json!({
+                "success": true,
+                "profiles": [{
+                    "selected": true,
+                    "members": {
+                        "0123456789abcdef0123456789abcdef": {
+                            "currencies": { "coin": 42 }
+                        }
+                    }
+                }]
+            })
+            .to_string()
+        }
+
+        /// Starts the fake upstream and returns its base url and the number of
+        /// requests that reached it.
+        async fn fake_upstream(behaviour: Behaviour) -> (String, Arc<AtomicUsize>) {
+            type Script = (Behaviour, Arc<AtomicUsize>);
+
+            async fn answer(State((behaviour, calls)): State<Script>) -> (StatusCode, String) {
+                calls.fetch_add(1, Ordering::SeqCst);
+                match behaviour {
+                    Behaviour::NotJson => (StatusCode::OK, "not json".to_string()),
+                    Behaviour::Truncated => (
+                        StatusCode::OK,
+                        "{\"success\":true,\"profiles\":[".to_string(),
+                    ),
+                    Behaviour::MissingMember => (
+                        StatusCode::OK,
+                        json!({
+                            "success": true,
+                            "profiles": [{ "selected": true, "members": {} }]
+                        })
+                        .to_string(),
+                    ),
+                    // The body parses, but the status says the endpoint is not
+                    // there. That is a broken deployment, not a missing player.
+                    Behaviour::MissingResource => (StatusCode::NOT_FOUND, valid_profile()),
+                    Behaviour::Valid => (StatusCode::OK, valid_profile()),
+                    Behaviour::Slow(delay) => {
+                        tokio::time::sleep(delay).await;
+                        (StatusCode::OK, valid_profile())
+                    }
+                }
+            }
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route("/v2/skyblock/profiles", axum::routing::get(answer))
+                .with_state((behaviour, calls.clone()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the fake upstream binds");
+            let address = listener
+                .local_addr()
+                .expect("the fake upstream has an address");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            (format!("http://{address}"), calls)
+        }
+
+        /// A service whose client points at the fake upstream instead of Hypixel.
+        ///
+        /// Only the timeout is changed, and only here: `HypixelClient::new` keeps
+        /// the 20 s budget for everything that is not a test.
+        fn state_with_upstream(base: &str, timeout: Duration) -> Arc<AppState> {
+            let metrics = Arc::new(Metrics::new());
+            Arc::new(AppState {
+                auth: AuthService::new(
+                    b"a-test-secret-that-is-long-enough".to_vec(),
+                    Duration::from_secs(3600),
+                ),
+                hypixel: HypixelClient::with_timeout("a-test-key", base, timeout)
+                    .expect("the client is built")
+                    .with_metrics(Arc::clone(&metrics)),
+                profiles: TtlCache::new(Duration::from_secs(60), 8),
+                metrics,
+            })
+        }
+
+        /// A token that makes the router read the profile of `UUID`.
+        fn token(state: &AppState) -> String {
+            let uuid = uuid::Uuid::parse_str(UUID).expect("the uuid is valid");
+            state
+                .auth
+                .issue_token(&uuid, crate::auth::now_millis() + 60_000)
+        }
+
+        /// Drives one request through the real router and checks the answer is a
+        /// bad gateway with a JSON error body, that the upstream was called the
+        /// expected number of times, and that nothing broken was cached.
+        async fn assert_bad_gateway(
+            behaviour: Behaviour,
+            client_timeout: Duration,
+            expected_calls: usize,
+        ) {
+            let (base, calls) = fake_upstream(behaviour).await;
+            let state = state_with_upstream(&base, client_timeout);
+            let router = app(Arc::clone(&state));
+
+            let (status, headers, body) =
+                send_raw(&router, authorized("/v1/profile", &token(&state))).await;
+
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "the client has to be able to parse the error body"
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("the error body is JSON");
+            assert_eq!(body["error"], "upstream_error");
+            assert_eq!(
+                body["message"].as_str(),
+                Some("the Hypixel API could not be read")
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_calls,
+                "the upstream call count changed"
+            );
+            assert_eq!(state.profiles.len(), 0, "a failed fetch reached the cache");
+        }
+
+        #[tokio::test]
+        async fn a_non_json_upstream_answers_502_and_is_not_retried() {
+            // A decode failure is not a 5xx: the answer is broken, not early, so
+            // a second call would only spend the key again.
+            assert_bad_gateway(Behaviour::NotJson, UPSTREAM_TIMEOUT, 1).await;
+        }
+
+        #[tokio::test]
+        async fn a_truncated_body_answers_502_and_is_not_retried() {
+            // The upstream answers well within the 20 s budget, so the test is
+            // about the parse and not about the clock.
+            assert_bad_gateway(Behaviour::Truncated, UPSTREAM_TIMEOUT, 1).await;
+        }
+
+        #[tokio::test]
+        async fn an_upstream_404_with_a_valid_body_answers_502_and_is_not_retried() {
+            // A parseable body under a non-success status means the upstream
+            // endpoint is wrong, not that the player has no profile, so the
+            // client must not turn it into a 404 of its own.
+            assert_bad_gateway(Behaviour::MissingResource, UPSTREAM_TIMEOUT, 1).await;
+        }
+
+        #[tokio::test]
+        async fn an_upstream_that_stalls_past_the_timeout_answers_502() {
+            // A few dozen milliseconds model a stall that outlives the client
+            // timeout and still ends well inside the 30 s request timeout: the
+            // client gives up twice and the router reports a bad gateway. Both
+            // values are fractions of the production budget, so no real timeout
+            // moves.
+            let client_timeout = UPSTREAM_TIMEOUT / 800; // 25 ms
+            let upstream_delay = UPSTREAM_TIMEOUT / 400; // 50 ms
+            assert!(
+                client_timeout < upstream_delay,
+                "the test would not time out"
+            );
+
+            // A timeout is the one case the documented rules retry once, see
+            // `docs/ARCHITECTURE.md` section 3.3; the answer is still a 502.
+            assert_bad_gateway(Behaviour::Slow(upstream_delay), client_timeout, 2).await;
+        }
+
+        #[tokio::test]
+        async fn a_valid_profile_without_the_member_is_404_and_not_retried() {
+            // Not every bad answer is an upstream failure: a well formed answer
+            // for a player without a profile is a 404 the mod can act on, and a
+            // second call would not produce one either.
+            let (base, calls) = fake_upstream(Behaviour::MissingMember).await;
+            let state = state_with_upstream(&base, UPSTREAM_TIMEOUT);
+            let router = app(Arc::clone(&state));
+
+            let (status, _, body) =
+                send_with(&router, authorized("/v1/profile", &token(&state))).await;
+
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body["error"], "profile_not_found");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()),
+                "the error has no message: {body}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "a missing profile was retried"
+            );
+            assert_eq!(state.profiles.len(), 0, "a missing profile was cached");
+        }
+
+        #[tokio::test]
+        async fn a_valid_upstream_answers_the_profile_through_the_router() {
+            // The control for the tests above: the fake and the token work, so a
+            // 502 there is the failure path and not a broken fixture.
+            let (base, calls) = fake_upstream(Behaviour::Valid).await;
+            let state = state_with_upstream(&base, UPSTREAM_TIMEOUT);
+            let router = app(Arc::clone(&state));
+
+            let (status, _, body) =
+                send_with(&router, authorized("/v1/profile", &token(&state))).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["uuid"], UUID);
+            assert_eq!(body["currencies"]["coin"], 42);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state.profiles.len(), 1, "the profile was not cached");
+        }
     }
 }
