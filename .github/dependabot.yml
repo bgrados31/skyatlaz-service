@@ -11,6 +11,17 @@ updates:
     groups:
       rust:
         patterns: ["*"]
+    ignore:
+      # These four have to move together with `rsa`, and `rsa` 0.9 is built on
+      # `digest` 0.10: hmac 0.13, sha1 0.11, sha2 0.11 and digest 0.11 do not
+      # compile against it, because every trait bound changed. Dependabot
+      # proposed exactly that jump, grouped, and nothing in the crate built.
+      # Delete these rules in the commit that moves the family, which is a change
+      # of its own and waits on `rsa`.
+      - dependency-name: "digest"
+      - dependency-name: "hmac"
+      - dependency-name: "sha1"
+      - dependency-name: "sha2"
 
   # Actions used by the workflow above.
   - package-ecosystem: github-actions
