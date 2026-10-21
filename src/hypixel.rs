@@ -5,6 +5,7 @@
 //! and the traffic low.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rand_core::{OsRng, RngCore};
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::now_millis;
+use crate::metrics::{Metrics, Outcome};
 use crate::ratelimit::RateLimits;
 
 /// How many times one upstream call is attempted.
@@ -88,6 +90,8 @@ pub struct HypixelClient {
     api_key: String,
     base: String,
     limits: RateLimits,
+    /// Where the outcome of every fetch is counted, when somebody is listening.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl HypixelClient {
@@ -102,7 +106,14 @@ impl HypixelClient {
             api_key: api_key.to_string(),
             base: base.trim_end_matches('/').to_string(),
             limits: RateLimits::default(),
+            metrics: None,
         })
+    }
+
+    /// Counts the outcome of every fetch in the given table.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// How many requests the key may do in the window, and how many are left.
@@ -122,12 +133,33 @@ impl HypixelClient {
             match self.fetch_once(uuid).await {
                 Err(error) if attempt < ATTEMPTS && error.is_transient() => {
                     tracing::debug!(%error, attempt, "the upstream failed, trying once more");
+                    if let Some(metrics) = self.metrics.as_ref() {
+                        metrics.upstream_retry();
+                    }
                     tokio::time::sleep(retry_delay()).await;
                     attempt += 1;
                 }
-                result => return result,
+                result => {
+                    self.record_outcome(&result);
+                    return result;
+                }
             }
         }
+    }
+
+    /// Counts one fetch by its final outcome, whichever way it ended and after
+    /// however many attempts.
+    fn record_outcome(&self, result: &Result<SlimProfile, HypixelError>) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let outcome = match result {
+            Ok(_) => Outcome::Ok,
+            Err(HypixelError::RateLimited(_)) => Outcome::RateLimited,
+            Err(HypixelError::Missing(_)) => Outcome::Missing,
+            Err(_) => Outcome::Failed,
+        };
+        metrics.profile_fetch(outcome);
     }
 
     /// One upstream call.

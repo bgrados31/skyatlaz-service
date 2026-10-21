@@ -11,14 +11,16 @@ mod cache;
 mod config;
 mod hypixel;
 mod keys;
+mod metrics;
 mod ratelimit;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -33,6 +35,7 @@ use crate::auth::{AuthService, VerifyRequest, VerifyResponse};
 use crate::cache::TtlCache;
 use crate::config::Config;
 use crate::hypixel::{HypixelClient, HypixelError, SlimProfile};
+use crate::metrics::{Metrics, Route, Values};
 
 /// The contract of the service, so a client can be written against it.
 const OPENAPI: &str = include_str!("../openapi.json");
@@ -46,6 +49,10 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// gives up on its own after twenty seconds, so this only catches the rest.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The format version of the counters, as Prometheus expects it in the content
+/// type of an exposition.
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
 /// Everything the handlers need.
 pub struct AppState {
     /// The authentication service.
@@ -54,6 +61,8 @@ pub struct AppState {
     pub hypixel: HypixelClient,
     /// The cached profiles.
     pub profiles: TtlCache<String, SlimProfile>,
+    /// The counters served at `/metrics`.
+    pub metrics: Arc<Metrics>,
 }
 
 /// An error that is turned into a JSON body.
@@ -202,6 +211,38 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// The counters, in the Prometheus text format.
+///
+/// The numbers that only exist at scrape time are read from where they live
+/// instead of being copied into a counter: the cache knows how many entries it
+/// holds and the upstream client knows what its key may still do.
+async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (limit, remaining) = state.hypixel.rate_limit();
+    let body = state.metrics.render(Values {
+        cache_entries: state.profiles.len(),
+        rate_limit: limit,
+        rate_limit_remaining: remaining,
+    });
+    ([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], body)
+}
+
+/// Counts a request once it has been answered, whatever the answer was.
+///
+/// The path is picked by the caller, so it is resolved through the closed set of
+/// names of `metrics::Route` and never used as a label value directly: a table
+/// whose size a client chooses is a memory leak with a nice format.
+async fn count_request(
+    State(metrics): State<Arc<Metrics>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let route = Route::of(request.uri().path());
+    let started = Instant::now();
+    let response = next.run(request).await;
+    metrics.record(route, response.status().as_u16(), started.elapsed());
+    response
+}
+
 /// The contract of the service.
 async fn openapi() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/json")], OPENAPI)
@@ -277,8 +318,10 @@ async fn profile(
         .map_err(|error| ApiError::unauthorized_bearer(error.to_string()))?;
 
     if let Some(cached) = state.profiles.get(&uuid) {
+        state.metrics.cache_hit();
         return Ok(Json(cached));
     }
+    state.metrics.cache_miss();
 
     let profile = state
         .hypixel
@@ -321,6 +364,7 @@ fn app(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi))
         .merge(api)
         .fallback(not_found)
@@ -338,6 +382,12 @@ fn app(state: Arc<AppState>) -> Router {
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
+        // Outermost, so a request that the timeout layer cuts short is counted
+        // with the status the client actually saw.
+        .layer(from_fn_with_state(
+            Arc::clone(&state.metrics),
+            count_request,
+        ))
         .with_state(state)
 }
 
@@ -389,10 +439,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })?;
 
+    let metrics = Arc::new(Metrics::new());
     let state = Arc::new(AppState {
         auth: AuthService::new(config.token_secret.clone(), config.token_ttl),
-        hypixel: HypixelClient::new(&config.hypixel_api_key, &config.hypixel_base)?,
+        hypixel: HypixelClient::new(&config.hypixel_api_key, &config.hypixel_base)?
+            .with_metrics(Arc::clone(&metrics)),
         profiles: TtlCache::new(config.profile_ttl, config.profile_cache_entries),
+        metrics,
     });
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -420,15 +473,20 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    use crate::hypixel::MiningProfile;
+
     fn state() -> Arc<AppState> {
+        let metrics = Arc::new(Metrics::new());
         Arc::new(AppState {
             auth: AuthService::new(
                 b"a-test-secret-that-is-long-enough".to_vec(),
                 Duration::from_secs(3600),
             ),
             hypixel: HypixelClient::new("a-test-key", "http://127.0.0.1:9")
-                .expect("the client is built"),
+                .expect("the client is built")
+                .with_metrics(Arc::clone(&metrics)),
             profiles: TtlCache::new(Duration::from_secs(60), 8),
+            metrics,
         })
     }
 
@@ -443,6 +501,23 @@ mod tests {
         router: &Router,
         request: Request<Body>,
     ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let (status, headers, body) = send_raw(router, request).await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, headers, json)
+    }
+
+    /// Sends a request and returns the body as text, for the routes that do not
+    /// answer with JSON.
+    async fn send_text(router: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let (status, headers, body) = send_raw(router, request).await;
+        (
+            status,
+            headers,
+            String::from_utf8(body).expect("the body is text"),
+        )
+    }
+
+    async fn send_raw(router: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
         let response = router
             .clone()
             .oneshot(request)
@@ -453,8 +528,29 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("the body is readable");
-        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-        (status, headers, json)
+        (status, headers, body.to_vec())
+    }
+
+    /// A profile the tests can put in the cache without an upstream call.
+    fn profile(uuid: &str) -> SlimProfile {
+        SlimProfile {
+            uuid: uuid.to_string(),
+            name: None,
+            mining: MiningProfile::default(),
+            dungeons: serde_json::Value::Null,
+            currencies: serde_json::Value::Null,
+            fetched_at: 0,
+        }
+    }
+
+    /// A request that carries a bearer token.
+    fn authorized(uri: &str, token: &str) -> Request<Body> {
+        let mut request = get(uri);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("the token is a header value"),
+        );
+        request
     }
 
     fn get(uri: &str) -> Request<Body> {
@@ -483,6 +579,7 @@ mod tests {
 
         for path in [
             "/health",
+            "/metrics",
             "/openapi.json",
             "/v1/auth/challenge",
             "/v1/auth/verify",
@@ -537,6 +634,104 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("nosniff")
         );
+    }
+
+    #[tokio::test]
+    async fn the_metrics_endpoint_is_a_prometheus_document() {
+        let state = state();
+        let router = app(Arc::clone(&state));
+        let (status, _, _) = send_with(&router, get("/health")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, headers, body) = send_text(&router, get("/metrics")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        assert!(
+            body.contains("skyatlaz_http_requests_total{route=\"health\",status=\"2xx\"} 1"),
+            "the health request was not counted: {body}"
+        );
+        assert!(body.contains("skyatlaz_profile_cache_entries 0"), "{body}");
+        assert!(
+            body.contains("skyatlaz_upstream_rate_limit_remaining 0"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_path_does_not_create_a_series_of_its_own() {
+        let state = state();
+        let router = app(Arc::clone(&state));
+        for index in 0..40 {
+            let (status, _, _) = send_with(&router, get(&format!("/invented/{index}"))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        let (_, _, body) = send_text(&router, get("/metrics")).await;
+
+        assert!(!body.contains("/invented"), "a path reached the metrics");
+        // Seven routes and three status classes, so twenty one series whatever
+        // the callers do.
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with("skyatlaz_http_requests_total{"))
+                .count(),
+            21,
+            "the table grew with the paths"
+        );
+        assert!(
+            body.contains("skyatlaz_http_requests_total{route=\"other\",status=\"4xx\"} 40"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_and_a_missed_fetch_are_counted_apart() {
+        let state = state();
+        let router = app(Arc::clone(&state));
+
+        // A player whose profile is already in the cache is answered without
+        // touching the upstream.
+        let cached = uuid::Uuid::new_v4();
+        let token = state
+            .auth
+            .issue_token(&cached, crate::auth::now_millis() + 60_000);
+        state
+            .profiles
+            .insert(cached.to_string(), profile(&cached.to_string()));
+        let (status, _, _) = send_with(&router, authorized("/v1/profile", &token)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A player whose profile is not cached needs the upstream, and this test
+        // points the client at a port nothing listens on.
+        let uncached = uuid::Uuid::new_v4();
+        let token = state
+            .auth
+            .issue_token(&uncached, crate::auth::now_millis() + 60_000);
+        let (status, _, _) = send_with(&router, authorized("/v1/profile", &token)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let (_, _, body) = send_text(&router, get("/metrics")).await;
+
+        assert!(
+            body.contains("skyatlaz_profile_cache_hits_total 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("skyatlaz_profile_cache_misses_total 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("skyatlaz_profile_fetches_total{outcome=\"failed\"} 1"),
+            "{body}"
+        );
+        // The connection was refused, which is worth a second attempt.
+        assert!(body.contains("skyatlaz_upstream_retries_total 1"), "{body}");
     }
 
     #[tokio::test]

@@ -63,6 +63,18 @@
         }
       }
     },
+    "/metrics": {
+      "get": {
+        "summary": "The counters, in the Prometheus text format.",
+        "description": "Aggregates only: no token, no uuid and no profile crosses this answer. Routes and statuses are counted under fixed names, so a caller cannot make a series of its own, and no counter is per player.",
+        "responses": {
+          "200": {
+            "description": "One series per line, in the text exposition format version 0.0.4.",
+            "content": { "text/plain": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
     "/v1/auth/challenge": {
       "get": {
         "summary": "Hands out a single use nonce that the client has to sign.",

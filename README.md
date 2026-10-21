@@ -39,6 +39,7 @@ build instead of the game.
 | Method | Path                 | Auth            | Description                              |
 | ------ | -------------------- | --------------- | ---------------------------------------- |
 | GET    | `/health`            | none            | Liveness probe.                          |
+| GET    | `/metrics`           | none            | Counters in the Prometheus text format.  |
 | GET    | `/openapi.json`      | none            | The contract of the service.             |
 | GET    | `/v1/auth/challenge` | none            | Hands out a single use nonce.            |
 | POST   | `/v1/auth/verify`    | signed nonce    | Verifies the signature, returns a token. |

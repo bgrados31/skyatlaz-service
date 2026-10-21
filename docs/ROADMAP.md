@@ -34,8 +34,12 @@ traffic. This file is the source of truth for what is done and what is next; see
 - [x] Graceful shutdown on SIGTERM and Ctrl-C.
 - [x] Structured request logging with method, path, status and latency.
 - [x] `/health` reports the upstream rate limit state and the cache size.
+- [x] `/metrics` in the Prometheus text format: request counts per route and
+      status class, a latency histogram per route, cache hits and misses, profile
+      fetches by outcome, retries, and three gauges. Fixed label sets, atomics
+      only, no new dependency, and refused from the internet in the Caddyfile.
 - [x] HTTP tests through the real router (`oneshot`), contract tests, and unit
-      tests for every new rule: 60 tests, no network.
+      tests for every new rule: 69 tests, no network.
 - [x] One RSA key pair per test binary (`OnceLock`) instead of one per test,
       which took the suite from about 45 s to under 5 s in a debug build.
 - [x] CI (fmt, clippy `-D warnings`, tests on Linux and Windows, release build),
@@ -99,33 +103,27 @@ regression of more than 2× in the cached path is a bug.
 
 ## P1 — next round
 
-1. **Metrics.** A `/metrics` endpoint in Prometheus text format: request count by
-   route and status, cache hits and misses, upstream calls and their outcome,
-   rate limit remaining as a gauge, request latency histogram. Keep it dependency
-   light; if a crate is needed, prefer `metrics` + `metrics-exporter-prometheus`.
-   *Why:* the current signals are logs and a JSON health check; without counters
-   a cache regression or an upstream error rate is invisible.
-2. **Single-flight on cache misses.** Two concurrent requests for the same player
+1. **Single-flight on cache misses.** Two concurrent requests for the same player
    both call Hypixel. A per-uuid async lock (or a `DashMap` of in-flight
    futures) removes the duplicate without adding state that outlives the request.
    *Done when:* 50 concurrent requests for the same uuid produce one upstream
    call in a test with a mock server.
-3. **Malformed and slow upstream, end to end.** The client side is covered: a
+2. **Malformed and slow upstream, end to end.** The client side is covered: a
    truncated body is not retried and a bad answer becomes an `ApiError`. What no
    test does is drive the whole router against an upstream that answers with
    broken JSON or too slowly. *Done when:* a `oneshot` request through the router
    against a fake upstream that sends `not json`, or sleeps past the timeout,
    answers `502`.
-4. **Supply chain job.** `cargo deny check` (licences, advisories, duplicates) on
+3. **Supply chain job.** `cargo deny check` (licences, advisories, duplicates) on
    a weekly schedule, separate from the per-PR workflow so a new advisory does
    not block an unrelated change.
-5. **Prebuilt release artifacts.** A workflow that produces
+4. **Prebuilt release artifacts.** A workflow that produces
    `skyatlaz-service-linux-arm64` plus a checksum on tag, so deploying is a
    download instead of a 5–10 minute compile on a 1 OCPU VM. This also removes
    the need for a Rust toolchain in production.
-6. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
+5. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
    `parse_mining`. Both consume untrusted JSON that changes without notice.
-7. **Split liveness and readiness** if a load balancer is added: `/health` stays
+6. **Split liveness and readiness** if a load balancer is added: `/health` stays
    dependency free, `/ready` can report whether the upstream is usable.
 
 ## P2 — later

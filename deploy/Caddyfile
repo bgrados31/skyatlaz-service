@@ -9,6 +9,11 @@
 # has to be reachable from the internet.
 
 skyatlaz.example.com {
+	# The counters are an operational signal and nobody outside the host needs
+	# them: scrape them over loopback and keep them off the internet.
+	@metrics path /metrics
+	respond @metrics 404
+
 	reverse_proxy 127.0.0.1:8080
 
 	# The service has its own authentication. Do not log the bearer tokens.
