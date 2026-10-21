@@ -14,6 +14,7 @@
 //! its own profile.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +37,47 @@ const DEFAULT_CHALLENGE_TTL: Duration = Duration::from_secs(300);
 /// nonces may not grow without a limit.
 const MAX_CHALLENGES: usize = 10_000;
 
+/// How many challenges one address may ask for in a minute.
+const CHALLENGES_PER_IP_PER_MINUTE: u32 = 30;
+
+/// How many addresses are remembered.
+const MAX_TRACKED_IPS: usize = 10_000;
+
+/// How long the challenges of one address are counted.
+const IP_WINDOW: Duration = Duration::from_secs(60);
+
+/// The number of challenges per address, and when the window started.
+#[derive(Default)]
+struct IpLimits {
+    counts: HashMap<IpAddr, (u32, Instant)>,
+}
+
+impl IpLimits {
+    /// Counts one challenge of that address. False when the address asked too many times.
+    fn take(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        if self.counts.len() >= MAX_TRACKED_IPS {
+            self.counts
+                .retain(|_, (_, started)| now.duration_since(*started) < IP_WINDOW);
+            // A flood from more addresses than we are willing to track leaves
+            // the map full. Starting the window over keeps the memory bounded;
+            // these counters are defence in depth, not an audit record.
+            if self.counts.len() >= MAX_TRACKED_IPS {
+                self.counts.clear();
+            }
+        }
+        let entry = self.counts.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) >= IP_WINDOW {
+            *entry = (0, now);
+        }
+        if entry.0 >= CHALLENGES_PER_IP_PER_MINUTE {
+            return false;
+        }
+        entry.0 += 1;
+        true
+    }
+}
+
 /// The nonces that were handed out and are still waiting to be used.
 #[derive(Default)]
 struct Challenges {
@@ -45,11 +87,7 @@ struct Challenges {
 
 impl Challenges {
     /// Remembers a nonce and drops the oldest ones when there are too many.
-    fn insert(
-        &mut self,
-        nonce: String,
-        issued: Instant,
-    ) {
+    fn insert(&mut self, nonce: String, issued: Instant) {
         self.order.push_back(nonce.clone());
         self.entries.insert(nonce, issued);
         while self.entries.len() > MAX_CHALLENGES {
@@ -63,20 +101,14 @@ impl Challenges {
     }
 
     /// Uses a nonce once. A second attempt with the same nonce finds nothing.
-    fn take(
-        &mut self,
-        nonce: &str,
-    ) -> Option<Instant> {
+    fn take(&mut self, nonce: &str) -> Option<Instant> {
         let issued = self.entries.remove(nonce)?;
         self.order.retain(|item| item != nonce);
         Some(issued)
     }
 
     /// Forgets the nonces that are too old to be used.
-    fn purge(
-        &mut self,
-        ttl: Duration,
-    ) {
+    fn purge(&mut self, ttl: Duration) {
         let now = Instant::now();
         let expired: Vec<String> = self
             .entries
@@ -97,6 +129,7 @@ pub struct AuthService {
     token_ttl: Duration,
     challenge_ttl: Duration,
     challenges: Mutex<Challenges>,
+    ip_limits: Mutex<IpLimits>,
 }
 
 impl AuthService {
@@ -107,7 +140,15 @@ impl AuthService {
             token_ttl,
             challenge_ttl: DEFAULT_CHALLENGE_TTL,
             challenges: Mutex::new(Challenges::default()),
+            ip_limits: Mutex::new(IpLimits::default()),
         }
+    }
+
+    /// Whether the address may ask for another challenge. The endpoint is open to anybody, so one address may
+    /// not flood it.
+    pub fn allow_challenge(&self, ip: IpAddr) -> bool {
+        let mut limits = self.ip_limits.lock().unwrap_or_else(|e| e.into_inner());
+        limits.take(ip)
     }
 
     /// Hands out a fresh single use nonce.
@@ -142,8 +183,10 @@ impl AuthService {
         let uuid = Uuid::parse_str(&request.uuid).map_err(|_| AuthError::InvalidUuid)?;
 
         // The caller has to prove that it owns the private key of the public key.
-        let public_key = keys::decode_public_key(&request.public_key).ok_or(AuthError::InvalidPublicKey)?;
-        let signature = keys::decode_signature(&request.signature).ok_or(AuthError::InvalidSignature)?;
+        let public_key =
+            keys::decode_public_key(&request.public_key).ok_or(AuthError::InvalidPublicKey)?;
+        let signature =
+            keys::decode_signature(&request.signature).ok_or(AuthError::InvalidSignature)?;
         let nonce_bytes = BASE64
             .decode(request.nonce.as_bytes())
             .map_err(|_| AuthError::UnknownNonce)?;
@@ -154,7 +197,12 @@ impl AuthService {
         // The public key has to be one Mojang issued for this player.
         let key_signature = keys::decode_signature(&request.public_key_signature)
             .ok_or(AuthError::InvalidKeySignature)?;
-        if !keys::verify_mojang_key_signature(&uuid, request.expires_at, &public_key, &key_signature) {
+        if !keys::verify_mojang_key_signature(
+            &uuid,
+            request.expires_at,
+            &public_key,
+            &key_signature,
+        ) {
             return Err(AuthError::InvalidKeySignature);
         }
 
@@ -195,7 +243,10 @@ impl AuthService {
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts keys of any length");
         mac.update(payload.as_bytes());
-        format!("{payload}:{}", BASE64_URL.encode(mac.finalize().into_bytes()))
+        format!(
+            "{payload}:{}",
+            BASE64_URL.encode(mac.finalize().into_bytes())
+        )
     }
 }
 
@@ -305,7 +356,10 @@ mod tests {
         let uuid = Uuid::new_v4();
         let token = service.issue_token(&uuid, now_millis() + 60_000);
         let tampered = token.replace(&uuid.to_string(), &Uuid::new_v4().to_string());
-        assert_eq!(service.validate_token(&tampered), Err(AuthError::InvalidToken));
+        assert_eq!(
+            service.validate_token(&tampered),
+            Err(AuthError::InvalidToken)
+        );
     }
 
     #[test]
@@ -326,6 +380,54 @@ mod tests {
 
         let challenges = service.challenges.lock().unwrap();
         assert!(challenges.entries.len() <= MAX_CHALLENGES);
+    }
+
+    #[test]
+    fn one_address_cannot_flood_the_challenge_endpoint() {
+        let service = service();
+        let mine = IpAddr::from([127, 0, 0, 1]);
+        let other = IpAddr::from([10, 0, 0, 1]);
+
+        for _ in 0..CHALLENGES_PER_IP_PER_MINUTE {
+            assert!(service.allow_challenge(mine));
+        }
+
+        assert!(
+            !service.allow_challenge(mine),
+            "the address is over its budget"
+        );
+        assert!(
+            service.allow_challenge(other),
+            "another address has its own budget"
+        );
+    }
+
+    #[test]
+    fn one_address_may_not_ask_for_endless_challenges() {
+        let service = service();
+        let address = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        for _ in 0..CHALLENGES_PER_IP_PER_MINUTE {
+            assert!(service.allow_challenge(address));
+        }
+        assert!(!service.allow_challenge(address));
+
+        // Another address is not punished for it.
+        let other = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert!(service.allow_challenge(other));
+    }
+
+    #[test]
+    fn the_tracked_addresses_do_not_grow_without_a_limit() {
+        let service = service();
+
+        for index in 0..(MAX_TRACKED_IPS + 100) {
+            let address = IpAddr::V4(std::net::Ipv4Addr::from(index as u32));
+            service.allow_challenge(address);
+        }
+
+        let limits = service.ip_limits.lock().unwrap();
+        assert!(limits.counts.len() <= MAX_TRACKED_IPS);
     }
 
     #[test]

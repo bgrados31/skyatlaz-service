@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+.idea/
+.codebase-memory/
+.env
+.env.*
+!.env.example
+*.log
+docs/
+deploy/
+Dockerfile
+.dockerignore

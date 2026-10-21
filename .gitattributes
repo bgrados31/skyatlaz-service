@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# Keep the wire format of the contract exactly as served.
+openapi.json text eol=lf
+
+# Do not normalise binary assets if any are added later.
+*.png binary
+*.jpg binary
+*.ico binary
+*.jar binary
+
+# Generated files stay diffable but with a stable line ending.
+Cargo.lock text eol=lf

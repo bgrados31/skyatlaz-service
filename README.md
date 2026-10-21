@@ -60,6 +60,21 @@ build instead of the game.
 
 The profile endpoint only ever serves the profile of the authenticated player.
 
+### Status codes
+
+| Status | Body `error`        | When                                                   |
+| ------ | ------------------- | ------------------------------------------------------ |
+| `401`  | `unauthorized`      | Missing, malformed or expired token; bad signature.    |
+| `404`  | `profile_not_found` | The player has no SkyBlock profile to read.            |
+| `404`  | `not_found`         | No route matches the path.                             |
+| `413`  | –                   | The body is larger than 64 KiB.                        |
+| `429`  | `too_many_requests` | More than 30 challenges from one address in a minute.  |
+| `502`  | `upstream_error`    | Hypixel returned an error or could not be reached.     |
+| `503`  | `rate_limited`      | The key used up its rate limit; see `Retry-After`.     |
+
+Every error is JSON with `error` and `message`, including the ones axum would
+answer by itself. Responses under `/v1` carry `Cache-Control: no-store`.
+
 ## Configuration
 
 All configuration comes from the environment.
@@ -67,11 +82,17 @@ All configuration comes from the environment.
 | Variable                | Required | Default                    | Description                                    |
 | ----------------------- | -------- | -------------------------- | ---------------------------------------------- |
 | `HYPIXEL_API_KEY`       | yes      | –                          | Your Hypixel developer key.                    |
-| `SKYATLAZ_TOKEN_SECRET` | no       | random on every start      | Secret that signs the session tokens.          |
+| `SKYATLAZ_TOKEN_SECRET` | no       | random on every start      | Secret that signs the session tokens (32+ bytes). |
 | `BIND`                  | no       | `127.0.0.1:8080`           | Address the server listens on.                 |
+| `PORT`                  | no       | –                          | Used when `BIND` is unset; listens on `0.0.0.0`. |
 | `HYPIXEL_API_BASE`      | no       | `https://api.hypixel.net`  | Base url of the Hypixel API.                   |
 | `PROFILE_TTL_SECONDS`   | no       | `300`                      | How long a profile stays cached.               |
+| `PROFILE_CACHE_ENTRIES` | no       | `1024`                     | How many profiles the cache may hold (max 100000). |
 | `TOKEN_TTL_SECONDS`     | no       | `3600`                     | How long a session token stays valid.          |
+
+A value the service cannot work with stops it at startup instead of failing later:
+a zero ttl, a cache size out of range, a `PORT` that is not a port. The message
+names the variable and the value it read.
 
 ## Running it locally
 
@@ -90,16 +111,37 @@ curl.exe http://127.0.0.1:8080/health
 
 The mod talks to `http://127.0.0.1:8080` by default, see the `service.url` setting.
 
-## Tests
+## Development
+
+The toolchain is pinned in `rust-toolchain.toml`, so `rustup` installs the same
+compiler that CI uses on first run.
 
 ```powershell
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" test
+& "$env:USERPROFILE\.cargo\bin\cargo.exe" fmt --all
+& "$env:USERPROFILE\.cargo\bin\cargo.exe" clippy --all-targets -- -D warnings
+& "$env:USERPROFILE\.cargo\bin\cargo.exe" test --all-targets
+& "$env:USERPROFILE\.cargo\bin\cargo.exe" build --release
 ```
+
+CI runs those commands on Linux and Windows (`.github/workflows/ci.yml`). The
+tests need no network and no key: the Hypixel answers are fixtures.
+
+- Rules for changing the code: `AGENTS.md`.
+- Design, budgets and failure modes: `docs/ARCHITECTURE.md`.
+- What is done and what is next: `docs/ROADMAP.md`.
+- Deployment on Oracle Cloud: `deploy/README.md`.
 
 ## Notes
 
-- The cache keeps one profile per player for `PROFILE_TTL_SECONDS`, so a mod that polls
-  every minute does not spend any rate limit.
+- The cache holds at most `PROFILE_CACHE_ENTRIES` profiles and evicts the least
+  recently used one, so memory is bounded by configuration rather than traffic.
+- A profile stays cached for `PROFILE_TTL_SECONDS`: one player polling the mod
+  costs at most twelve upstream requests per hour, and one key serves about 120
+  continuously active players.
 - The raw Hypixel profile is around a megabyte. Only the mining tree, the dungeon
   statistics and the currencies are kept, the rest is dropped before the answer is cached.
 - Never commit the developer key. Keep it in the environment of the process.
+- Requests are logged with method, path, status and latency; tokens, keys and
+  signatures never reach the logs.
+- The process finishes the open requests and exits on SIGTERM, which is what
+  `systemctl restart` sends.

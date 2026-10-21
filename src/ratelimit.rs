@@ -25,12 +25,7 @@ struct State {
 
 impl RateLimits {
     /// Reads the headers of an answer and remembers what they say.
-    pub fn update(
-        &self,
-        limit: Option<u32>,
-        remaining: Option<u32>,
-        reset: Option<u64>,
-    ) {
+    pub fn update(&self, limit: Option<u32>, remaining: Option<u32>, reset: Option<u64>) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(limit) = limit {
             state.limit = limit;

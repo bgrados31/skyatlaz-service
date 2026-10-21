@@ -13,24 +13,38 @@ mod hypixel;
 mod keys;
 mod ratelimit;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
 use crate::auth::{AuthService, VerifyRequest, VerifyResponse};
 use crate::cache::TtlCache;
 use crate::config::Config;
-use crate::hypixel::{HypixelClient, SlimProfile};
+use crate::hypixel::{HypixelClient, HypixelError, SlimProfile};
 
 /// The contract of the service, so a client can be written against it.
 const OPENAPI: &str = include_str!("../openapi.json");
+
+/// The largest request the service reads. A verify request carries two RSA
+/// signatures and a public key, which is about one kilobyte, so anything close
+/// to this limit is not a client the service has to serve.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// How long a request may take before the service gives up. The Hypixel client
+/// gives up on its own after twenty seconds, so this only catches the rest.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Everything the handlers need.
 pub struct AppState {
@@ -51,22 +65,91 @@ pub struct ApiError {
     pub code: &'static str,
     /// A human readable message.
     pub message: String,
+    /// The seconds the client should wait, sent as `Retry-After`.
+    pub retry_after: Option<u64>,
+    /// Whether the answer asks the client to authenticate with a bearer token.
+    pub www_authenticate: bool,
 }
 
 impl ApiError {
+    /// The request did not carry a valid session token.
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthorized",
             message: message.into(),
+            retry_after: None,
+            www_authenticate: false,
         }
     }
 
-    fn bad_gateway(message: impl Into<String>) -> Self {
+    /// The caller of the profile endpoint did not authenticate with a token.
+    fn unauthorized_bearer(message: impl Into<String>) -> Self {
+        Self {
+            www_authenticate: true,
+            ..Self::unauthorized(message)
+        }
+    }
+
+    /// The player has no profile the service can read.
+    fn profile_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "profile_not_found",
+            message: "the player has no SkyBlock profile the service can read".to_string(),
+            retry_after: None,
+            www_authenticate: false,
+        }
+    }
+
+    /// The address asked for too many challenges in a minute.
+    fn too_many_requests() -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "too_many_requests",
+            message: "too many challenges from this address".to_string(),
+            // The window is a minute, so that is the honest wait.
+            retry_after: Some(60),
+            www_authenticate: false,
+        }
+    }
+
+    /// The Hypixel API could not be read.
+    fn upstream(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
             code: "upstream_error",
             message: message.into(),
+            retry_after: None,
+            www_authenticate: false,
+        }
+    }
+
+    /// The key used up its rate limit, so the client should come back later.
+    fn unavailable(wait: Duration) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "rate_limited",
+            message: "the service used up the Hypixel rate limit, retry later".to_string(),
+            retry_after: Some(wait.as_secs().max(1)),
+            www_authenticate: false,
+        }
+    }
+
+    /// Turns a client failure into an answer the mod can act on.
+    fn from_hypixel(error: HypixelError) -> Self {
+        match error {
+            HypixelError::RateLimited(wait) => Self::unavailable(wait),
+            HypixelError::Missing(field) => {
+                tracing::debug!(field, "the player has no profile the service can read");
+                Self::profile_not_found()
+            }
+            // The cause of an upstream failure is for the logs: a client cannot
+            // do anything with it and it may describe the state of the key.
+            other => {
+                tracing::warn!(error = %other, "the Hypixel API could not be read");
+                Self::upstream("the Hypixel API could not be read")
+            }
         }
     }
 }
@@ -80,14 +163,23 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(ErrorBody {
                 error: self.code,
                 message: &self.message,
             }),
         )
-            .into_response()
+            .into_response();
+
+        let headers = response.headers_mut();
+        if let Some(seconds) = self.retry_after {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        if self.www_authenticate {
+            headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        response
     }
 }
 
@@ -106,6 +198,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "service": "skyatlaz-service",
         "version": env!("CARGO_PKG_VERSION"),
         "rate_limit": { "limit": limit, "remaining": remaining },
+        "cache": { "entries": state.profiles.len() },
     }))
 }
 
@@ -114,10 +207,50 @@ async fn openapi() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/json")], OPENAPI)
 }
 
+/// Answers a path that does not exist with the same error shape as everything
+/// else, so a client never has to parse an empty body.
+async fn not_found() -> ApiError {
+    ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: "no route matches that path and method".to_string(),
+        retry_after: None,
+        www_authenticate: false,
+    }
+}
+
 /// Hands out a nonce the mod has to sign.
-async fn challenge(State(state): State<Arc<AppState>>) -> Json<ChallengeResponse> {
+async fn challenge(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<ChallengeResponse>, ApiError> {
+    if !state.auth.allow_challenge(client_address(peer, &headers)) {
+        return Err(ApiError::too_many_requests());
+    }
     let (nonce, expires_at) = state.auth.issue_challenge();
-    Json(ChallengeResponse { nonce, expires_at })
+    Ok(Json(ChallengeResponse { nonce, expires_at }))
+}
+
+/// Reads the address a request comes from, so the challenge limit applies to the
+/// caller and not to the proxy in front of it.
+///
+/// Behind Caddy every connection comes from loopback, so that is the only case
+/// where `X-Forwarded-For` is read: the proxy appends the address it saw, which
+/// is the last entry. For any other peer the socket address is the truth and the
+/// header is ignored, so a client cannot pick its own bucket.
+fn client_address(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    let peer = peer.ip();
+    if !peer.is_loopback() {
+        return peer;
+    }
+
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
 }
 
 /// Verifies the signed challenge and hands out a session token.
@@ -136,11 +269,12 @@ async fn profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<SlimProfile>, ApiError> {
-    let token = bearer_token(&headers).ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    let token = bearer_token(&headers)
+        .ok_or_else(|| ApiError::unauthorized_bearer("missing bearer token"))?;
     let uuid = state
         .auth
         .validate_token(token)
-        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
+        .map_err(|error| ApiError::unauthorized_bearer(error.to_string()))?;
 
     if let Some(cached) = state.profiles.get(&uuid) {
         return Ok(Json(cached));
@@ -150,15 +284,89 @@ async fn profile(
         .hypixel
         .fetch_profile(&uuid)
         .await
-        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+        .map_err(ApiError::from_hypixel)?;
     state.profiles.insert(uuid, profile.clone());
     Ok(Json(profile))
 }
 
-/// Reads the bearer token out of the headers.
+/// Reads the bearer token out of the headers. The scheme is case insensitive
+/// and an empty token is not a token.
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    value.strip_prefix("Bearer ").map(str::trim)
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Builds the router. Kept apart from `main` so the tests can exercise the real
+/// stack, with its layers, without binding a port.
+fn app(state: Arc<AppState>) -> Router {
+    // Everything under /v1 answers with data that belongs to one player, so no
+    // cache, proxy or browser may store it.
+    let api = Router::new()
+        .route("/v1/auth/challenge", get(challenge))
+        .route("/v1/auth/verify", post(verify))
+        .route("/v1/profile", get(profile))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::PRAGMA,
+            HeaderValue::from_static("no-cache"),
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/openapi.json", get(openapi))
+        .merge(api)
+        .fallback(not_found)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .with_state(state)
+}
+
+/// Resolves when the process is asked to stop, either by Ctrl-C or by the
+/// SIGTERM that systemd sends.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("the ctrl-c handler is installed");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("the SIGTERM handler is installed")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+
+    tracing::info!("a shutdown was requested, finishing the open requests");
 }
 
 #[tokio::main]
@@ -174,31 +382,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env()?;
-    let bind: SocketAddr = config.bind.parse()?;
+    let bind: SocketAddr = config.bind.parse().map_err(|error| {
+        format!(
+            "the bind address '{}' is not a valid address: {error}",
+            config.bind
+        )
+    })?;
 
     let state = Arc::new(AppState {
         auth: AuthService::new(config.token_secret.clone(), config.token_ttl),
         hypixel: HypixelClient::new(&config.hypixel_api_key, &config.hypixel_base)?,
-        profiles: TtlCache::new(config.profile_ttl),
+        profiles: TtlCache::new(config.profile_ttl, config.profile_cache_entries),
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/openapi.json", get(openapi))
-        .route("/v1/auth/challenge", get(challenge))
-        .route("/v1/auth/verify", post(verify))
-        .route("/v1/profile", get(profile))
-        .with_state(state);
-
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    tracing::info!(%bind, "skyatlaz-service is listening");
-    axum::serve(listener, app).await?;
+    tracing::info!(
+        %bind,
+        profile_ttl_seconds = config.profile_ttl.as_secs(),
+        token_ttl_seconds = config.token_ttl.as_secs(),
+        cache_entries = config.profile_cache_entries,
+        "skyatlaz-service is listening"
+    );
+
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn state() -> Arc<AppState> {
+        Arc::new(AppState {
+            auth: AuthService::new(
+                b"a-test-secret-that-is-long-enough".to_vec(),
+                Duration::from_secs(3600),
+            ),
+            hypixel: HypixelClient::new("a-test-key", "http://127.0.0.1:9")
+                .expect("the client is built"),
+            profiles: TtlCache::new(Duration::from_secs(60), 8),
+        })
+    }
+
+    /// Sends a request through the real router, layers included.
+    async fn send(request: Request<Body>) -> (StatusCode, HeaderMap, serde_json::Value) {
+        send_with(&app(state()), request).await
+    }
+
+    /// Sends a request through an existing router, so a test can reuse the
+    /// state of one service across several requests.
+    async fn send_with(
+        router: &Router,
+        request: Request<Body>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body is readable");
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, headers, json)
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("the request is valid");
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:1234"
+                .parse::<SocketAddr>()
+                .expect("the address is valid"),
+        ));
+        request
+    }
 
     fn contract() -> serde_json::Value {
         serde_json::from_str(OPENAPI).expect("the contract is valid json")
@@ -207,7 +477,9 @@ mod tests {
     #[test]
     fn the_contract_lists_every_endpoint() {
         let contract = contract();
-        let paths = contract["paths"].as_object().expect("the contract has paths");
+        let paths = contract["paths"]
+            .as_object()
+            .expect("the contract has paths");
 
         for path in [
             "/health",
@@ -216,7 +488,10 @@ mod tests {
             "/v1/auth/verify",
             "/v1/profile",
         ] {
-            assert!(paths.contains_key(path), "the contract does not mention {path}");
+            assert!(
+                paths.contains_key(path),
+                "the contract does not mention {path}"
+            );
         }
     }
 
@@ -230,5 +505,242 @@ mod tests {
         assert!(schemas["MiningProfile"]["properties"]["toggles"].is_object());
         assert!(schemas["MiningProfile"]["properties"]["powder"].is_object());
         assert!(schemas["MiningProfile"]["properties"]["ability"].is_object());
+    }
+
+    #[test]
+    fn the_contract_mentions_the_rate_limit_answer() {
+        let contract = contract();
+        let profile = &contract["paths"]["/v1/profile"]["get"]["responses"];
+
+        assert!(profile["404"].is_object(), "the contract misses a 404");
+        assert!(profile["503"].is_object(), "the contract misses a 503");
+    }
+
+    #[test]
+    fn the_contract_mentions_the_challenge_limit() {
+        let contract = contract();
+        let challenge = &contract["paths"]["/v1/auth/challenge"]["get"]["responses"];
+
+        assert!(challenge["429"].is_object(), "the contract misses a 429");
+    }
+
+    #[tokio::test]
+    async fn the_health_endpoint_reports_the_service() {
+        let (status, headers, body) = send(get("/health")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["service"], "skyatlaz-service");
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_contract_is_served_as_json() {
+        let (status, headers, body) = send(get("/openapi.json")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(body["openapi"], "3.1.0");
+    }
+
+    #[tokio::test]
+    async fn a_challenge_has_a_nonce() {
+        let (status, _, body) = send(get("/v1/auth/challenge")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["nonce"]
+                .as_str()
+                .is_some_and(|nonce| !nonce.is_empty()),
+            "the challenge has no nonce: {body}"
+        );
+        assert!(body["expires_at"].as_i64().is_some_and(|at| at > 0));
+    }
+
+    #[tokio::test]
+    async fn one_address_cannot_flood_the_challenge_endpoint() {
+        let router = app(state());
+        let peer = SocketAddr::from(([10, 0, 0, 7], 5000));
+
+        let mut throttled = None;
+        for _ in 0..1_000 {
+            let mut request = get("/v1/auth/challenge");
+            request.extensions_mut().insert(ConnectInfo(peer));
+            let (status, headers, _) = send_with(&router, request).await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                throttled = Some(headers);
+                break;
+            }
+        }
+
+        let headers = throttled.expect("the address is throttled at some point");
+        assert_eq!(
+            headers
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("60")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_challenge_limit_is_per_address_behind_the_proxy() {
+        let router = app(state());
+        let peer: SocketAddr = "127.0.0.1:5000".parse().expect("the address is valid");
+
+        async fn challenge_as(router: &Router, peer: SocketAddr, forwarded: &str) -> StatusCode {
+            let mut request = get("/v1/auth/challenge");
+            request.extensions_mut().insert(ConnectInfo(peer));
+            request.headers_mut().insert(
+                "x-forwarded-for",
+                forwarded.parse().expect("a valid header value"),
+            );
+            send_with(router, request).await.0
+        }
+
+        // One player uses up the window of that address...
+        let mut last = StatusCode::OK;
+        for _ in 0..31 {
+            last = challenge_as(&router, peer, "203.0.113.9").await;
+        }
+        assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+
+        // ...while the next player behind the same proxy still gets a nonce.
+        assert_eq!(
+            challenge_as(&router, peer, "203.0.113.10").await,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn the_forwarded_address_is_only_trusted_from_the_local_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.9, 198.51.100.7"
+                .parse()
+                .expect("a valid header value"),
+        );
+
+        // A remote peer is what it says it is, whatever the header claims.
+        let remote: SocketAddr = "10.0.0.7:5000".parse().expect("the address is valid");
+        assert_eq!(
+            client_address(remote, &headers),
+            IpAddr::from([10, 0, 0, 7])
+        );
+
+        // The proxy appends the address it saw, so the last entry wins.
+        let proxy: SocketAddr = "127.0.0.1:5000".parse().expect("the address is valid");
+        assert_eq!(
+            client_address(proxy, &headers),
+            IpAddr::from([198, 51, 100, 7])
+        );
+
+        // Without the header the proxy address is the only truth we have.
+        assert_eq!(client_address(proxy, &HeaderMap::new()), proxy.ip());
+    }
+
+    #[tokio::test]
+    async fn the_profile_endpoint_requires_a_token() {
+        let (status, headers, body) = send(get("/v1/profile")).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+        assert_eq!(
+            headers
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+        assert_eq!(
+            headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_that_was_not_issued_here_is_rejected() {
+        let request = Request::builder()
+            .uri("/v1/profile")
+            .header(header::AUTHORIZATION, "Bearer not-a-token")
+            .body(Body::empty())
+            .expect("the request is valid");
+
+        let (status, _, body) = send(request).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_answers_with_json() {
+        let (status, _, body) = send(get("/v1/unknown")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_refused() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/verify")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(vec![b'a'; MAX_REQUEST_BYTES + 1]))
+            .expect("the request is valid");
+
+        let (status, _, _) = send(request).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_verify_request_with_an_unknown_nonce_is_unauthorized() {
+        let payload = serde_json::json!({
+            "uuid": "01234567-89ab-cdef-0123-456789abcdef",
+            "public_key": "",
+            "public_key_signature": "",
+            "expires_at": 0,
+            "nonce": "bm90LWEtbm9uY2U=",
+            "signature": "",
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/verify")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .expect("the request is valid");
+
+        let (status, _, body) = send(request).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer  a-token".parse().unwrap());
+        assert_eq!(bearer_token(&headers), Some("a-token"));
+
+        headers.insert(header::AUTHORIZATION, "bearer a-token".parse().unwrap());
+        assert_eq!(bearer_token(&headers), Some("a-token"));
+
+        headers.insert(header::AUTHORIZATION, "Basic a-token".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(header::AUTHORIZATION, "Bearer   ".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
     }
 }

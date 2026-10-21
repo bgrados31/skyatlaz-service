@@ -12,8 +12,8 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use base64::Engine;
-use rsa::pkcs8::DecodePublicKey;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
 use rsa::RsaPublicKey;
 use sha1::Sha1;
@@ -23,7 +23,8 @@ use uuid::Uuid;
 /// Verifies a PKCS#1 v1.5 signature made with SHA-256 (the algorithm the
 /// vanilla client uses when signing chat and profile data).
 pub fn verify_sha256(public_key_der: &[u8], signature: &[u8], payload: &[u8]) -> bool {
-    let (Some(key), Some(signature)) = (parse_key(public_key_der), parse_signature(signature)) else {
+    let (Some(key), Some(signature)) = (parse_key(public_key_der), parse_signature(signature))
+    else {
         return false;
     };
     VerifyingKey::<Sha256>::new(key)
@@ -33,7 +34,8 @@ pub fn verify_sha256(public_key_der: &[u8], signature: &[u8], payload: &[u8]) ->
 
 /// Verifies a PKCS#1 v1.5 signature made with SHA-1.
 pub fn verify_sha1(public_key_der: &[u8], signature: &[u8], payload: &[u8]) -> bool {
-    let (Some(key), Some(signature)) = (parse_key(public_key_der), parse_signature(signature)) else {
+    let (Some(key), Some(signature)) = (parse_key(public_key_der), parse_signature(signature))
+    else {
         return false;
     };
     VerifyingKey::<Sha1>::new(key)
@@ -183,7 +185,9 @@ mod tests {
         let (private, der) = test_key();
         let payload = b"the nonce";
         let digest = Sha256::digest(payload);
-        let signature = private.sign(Pkcs1v15Sign::new::<Sha256>(), &digest).expect("sign");
+        let signature = private
+            .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+            .expect("sign");
         assert!(verify_sha256(&der, &signature, payload));
         assert!(!verify_sha256(&der, &signature, b"other"));
     }
@@ -194,7 +198,9 @@ mod tests {
         let (_, other_der) = test_key();
         let payload = b"the nonce";
         let digest = Sha256::digest(payload);
-        let signature = private.sign(Pkcs1v15Sign::new::<Sha256>(), &digest).expect("sign");
+        let signature = private
+            .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+            .expect("sign");
         assert!(!verify_sha256(&other_der, &signature, payload));
     }
 
@@ -205,8 +211,12 @@ mod tests {
         let expires_at = 1_700_000_000_000_i64;
         let payload = mojang_signed_payloads(&uuid, expires_at, &der).remove(0);
         let digest = Sha1::digest(&payload);
-        let signature = private.sign(Pkcs1v15Sign::new::<Sha1>(), &digest).expect("sign");
-        assert!(verify_mojang_key_signature(&uuid, expires_at, &der, &signature));
+        let signature = private
+            .sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
+            .expect("sign");
+        assert!(verify_mojang_key_signature(
+            &uuid, expires_at, &der, &signature
+        ));
     }
 
     #[test]
@@ -217,7 +227,11 @@ mod tests {
         let expires_at = 1_700_000_000_000_i64;
         let payload = mojang_signed_payloads(&uuid, expires_at, &der).remove(0);
         let digest = Sha1::digest(&payload);
-        let signature = private.sign(Pkcs1v15Sign::new::<Sha1>(), &digest).expect("sign");
-        assert!(!verify_mojang_key_signature(&other, expires_at, &der, &signature));
+        let signature = private
+            .sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
+            .expect("sign");
+        assert!(!verify_mojang_key_signature(
+            &other, expires_at, &der, &signature
+        ));
     }
 }
