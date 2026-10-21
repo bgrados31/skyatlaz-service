@@ -1,0 +1,271 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "skyatlaz-service",
+    "version": "0.1.0",
+    "description": "The SkyAtlaz service: it holds the Hypixel developer key and answers the profile of the player that asks for it. The mod signs a challenge with its Minecraft profile key pair and gets a token that only works for that player, so there is no endpoint that reads the profile of somebody else."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "The default local address. The mod reads it from the setting general.service_url."
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness probe.",
+        "responses": {
+          "200": {
+            "description": "The service is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "type": "boolean" },
+                    "service": { "type": "string" },
+                    "version": { "type": "string" },
+                    "rate_limit": {
+                      "type": "object",
+                      "description": "How many requests the key may do in the window, and how many are left.",
+                      "properties": {
+                        "limit": { "type": "integer", "format": "int32" },
+                        "remaining": { "type": "integer", "format": "int32" }
+                      },
+                      "required": ["limit", "remaining"]
+                    }
+                  },
+                  "required": ["ok", "service", "version"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This document.",
+        "responses": {
+          "200": {
+            "description": "The contract of the service.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    },
+    "/v1/auth/challenge": {
+      "get": {
+        "summary": "Hands out a single use nonce that the client has to sign.",
+        "responses": {
+          "200": {
+            "description": "The nonce to sign.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Challenge" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/verify": {
+      "post": {
+        "summary": "Verifies the signed challenge and hands out a session token.",
+        "description": "The client sends the nonce it got, the signature of the nonce made with the private half of the Minecraft profile key pair, the public key and the signature Mojang produced over it. The public key signature binds the key to the uuid, so the token belongs to that player and to nobody else.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/VerifyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The session token.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/VerifyResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "The challenge or the signatures are not valid.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/profile": {
+      "get": {
+        "summary": "The profile of the player that owns the token.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "The slim profile.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SlimProfile" }
+              }
+            }
+          },
+          "401": {
+            "description": "The token is missing or expired.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The session token of POST /v1/auth/verify."
+      }
+    },
+    "schemas": {
+      "Challenge": {
+        "type": "object",
+        "description": "A nonce to sign.",
+        "properties": {
+          "nonce": {
+            "type": "string",
+            "description": "Base64 of 32 random bytes. The client signs these bytes with the private profile key."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the nonce stops being valid, in milliseconds since the epoch."
+          }
+        },
+        "required": ["nonce", "expires_at"]
+      },
+      "VerifyRequest": {
+        "type": "object",
+        "properties": {
+          "uuid": {
+            "type": "string",
+            "description": "The uuid of the player, with or without dashes."
+          },
+          "public_key": {
+            "type": "string",
+            "description": "Base64 of the DER encoded public key of the profile key pair."
+          },
+          "public_key_signature": {
+            "type": "string",
+            "description": "Base64 of the signature Mojang produced over the public key."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the profile key expires, in milliseconds since the epoch."
+          },
+          "nonce": {
+            "type": "string",
+            "description": "The nonce of the challenge, unchanged."
+          },
+          "signature": {
+            "type": "string",
+            "description": "Base64 of the signature of the nonce bytes, made with the private profile key."
+          }
+        },
+        "required": ["uuid", "public_key", "public_key_signature", "expires_at", "nonce", "signature"]
+      },
+      "VerifyResponse": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The bearer token of the profile endpoint."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the token expires, in milliseconds since the epoch."
+          }
+        },
+        "required": ["token", "expires_at"]
+      },
+      "SlimProfile": {
+        "type": "object",
+        "description": "The profile of the player, reduced to what the features need.",
+        "properties": {
+          "uuid": { "type": "string" },
+          "name": {
+            "type": ["string", "null"],
+            "description": "The name of the player, when the API reports it."
+          },
+          "mining": { "$ref": "#/components/schemas/MiningProfile" },
+          "dungeons": {
+            "type": ["object", "null"],
+            "description": "The dungeon statistics, passed through as the API sends them.",
+            "additionalProperties": true
+          },
+          "currencies": {
+            "type": ["object", "null"],
+            "description": "The currencies of the player, passed through as the API sends them.",
+            "additionalProperties": true
+          },
+          "fetched_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the service fetched the profile, in milliseconds since the epoch."
+          }
+        },
+        "required": ["uuid", "mining", "dungeons", "currencies", "fetched_at"]
+      },
+      "MiningProfile": {
+        "type": "object",
+        "description": "The state of the mining tree.",
+        "properties": {
+          "perks": {
+            "type": "object",
+            "description": "The level of every perk of the tree, keyed by the perk id.",
+            "additionalProperties": { "type": "integer", "format": "int32" }
+          },
+          "toggles": {
+            "type": "object",
+            "description": "Whether every perk is toggled on, keyed by the perk id.",
+            "additionalProperties": { "type": "boolean" }
+          },
+          "ability": {
+            "type": ["string", "null"],
+            "description": "The pickaxe ability that is currently selected."
+          },
+          "powder": {
+            "type": "object",
+            "description": "The mined powder amounts, keyed by the powder id.",
+            "additionalProperties": { "type": "integer", "format": "int32" }
+          }
+        },
+        "required": ["perks", "toggles", "powder"]
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "A short machine readable code."
+          },
+          "message": {
+            "type": "string",
+            "description": "A human readable message."
+          }
+        },
+        "required": ["error", "message"]
+      }
+    }
+  }
+}
