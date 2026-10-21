@@ -2,8 +2,13 @@
 name = "skyatlaz-service"
 version = "0.1.0"
 edition = "2021"
-description = "Self-hosted Hypixel API proxy for the SkyAtlaz Minecraft mod"
+description = "Serves the SkyBlock profile of the authenticated player, holding one Hypixel key"
 license = "MIT"
+repository = "https://github.com/bgrados31/skyatlaz-service"
+homepage = "https://github.com/bgrados31/skyatlaz-service#readme"
+readme = "README.md"
+keywords = ["hypixel", "minecraft", "skyblock", "hypixel-api", "self-hosted"]
+categories = ["web-programming::http-server"]
 publish = false
 
 [dependencies]
