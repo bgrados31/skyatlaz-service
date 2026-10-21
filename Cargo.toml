@@ -17,18 +17,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 dotenvy = "0.15"
-hmac = "0.12"
+hmac = "0.13"
 rsa = "0.9"
-sha1 = { version = "0.10", features = ["oid"] }
-sha2 = { version = "0.10", features = ["oid"] }
-digest = { version = "0.10", features = ["oid"] }
+sha1 = { version = "0.11", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
+digest = { version = "0.11", features = ["oid"] }
 uuid = { version = "1", features = ["v4"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.6", features = ["set-header", "timeout", "trace"] }
+tower-http = { version = "0.7", features = ["set-header", "timeout", "trace"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
