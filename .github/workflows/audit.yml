@@ -1,0 +1,38 @@
+name: audit
+
+# The dependency list is small and boring on purpose, but a service that holds
+# somebody's key cannot ship a crate with a known advisory. Weekly, plus every
+# time the lock file changes.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the pinned toolchain and runs `cargo audit`. On failure it opens
+      # one issue and keeps updating it instead of failing silently: the advisory
+      # is the information, the red badge is not.
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
