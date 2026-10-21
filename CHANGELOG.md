@@ -14,6 +14,14 @@ release. Each section says what the mod has to do about it.
 - A weekly `cargo audit` job, so a crate that gains an advisory shows up as an
   issue even when nothing in this repository changed.
 
+### Security
+
+- The weekly audit ignores `RUSTSEC-2023-0071` (the Marvin attack on the `rsa`
+  crate, unpatched) because the service verifies signatures with a public key
+  and never signs, so it holds no private key to leak. The reason is written
+  next to the ignore in `.cargo/audit.toml` and in `SECURITY.md`, so the entry
+  cannot be mistaken for noise.
+
 ### Known gaps
 
 - A cache miss is not deduplicated: two requests for the same player in the same

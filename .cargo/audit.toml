@@ -1,0 +1,20 @@
+# Configuration for `cargo audit`, read by the weekly job in
+# .github/workflows/audit.yml and by a local `cargo audit`.
+#
+# Every entry below is a decision somebody made on purpose, so every entry
+# carries its reason. An advisory listed here without a comment is a bug of
+# this file.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071, the "Marvin attack": a private key can leak through
+  # timing while signing or decrypting. This service only ever calls
+  # `VerifyingKey::verify` (see src/keys.rs) on a public key it parsed from the
+  # request, so the process holds no private key to leak and signs nothing
+  # outside its tests. There is no measurement for an attacker to make.
+  #
+  # rsa 0.9.10 and even 0.10.0-rc are affected and the advisory has `patched =
+  # []` on purpose. Delete this line if the service ever signs with a private
+  # key, which it must not, and check again when rsa becomes constant time.
+  "RUSTSEC-2023-0071",
+]

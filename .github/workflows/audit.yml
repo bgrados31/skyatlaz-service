@@ -33,6 +33,9 @@ jobs:
       # Installs the pinned toolchain and runs `cargo audit`. On failure it opens
       # one issue and keeps updating it instead of failing silently: the advisory
       # is the information, the red badge is not.
+      #
+      # RUSTSEC-2023-0071 is ignored in .cargo/audit.toml, with the reason: the
+      # service only verifies signatures, it never holds a private key.
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

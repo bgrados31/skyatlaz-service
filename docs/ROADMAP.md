@@ -170,6 +170,7 @@ regression of more than 2× in the cached path is a bug.
 | No alerts on top of the counters | Failures are found by users, unless somebody watches `/metrics` | `/metrics` + `/health` + logs | Alerting rules (P2) |
 | Public challenge endpoint | Memory or CPU abuse | Bounded store, body limit | P0 per-IP limit |
 | Dependency drift | A vulnerable crate ships | Dependabot + weekly `cargo audit` | `cargo deny` for licences and duplicates (P1) |
+| `RUSTSEC-2023-0071` in `rsa` | None today: the service verifies signatures with a public key and never signs, so there is no private key to leak | Ignored in `.cargo/audit.toml` with the reason, so the weekly job stays meaningful | Drop the ignore if the service ever signs, or when `rsa` becomes constant time |
 | `panic = "abort"` | A panic is a restart, not a 500 | No panics on input, tests | Keep the rule |
 
 ## Not planned
