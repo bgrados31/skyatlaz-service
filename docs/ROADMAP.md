@@ -147,7 +147,7 @@ regression of more than 2× in the cached path is a bug.
 | --- | --- | --- | --- |
 | One key, one rate limit | Service refuses new players at peak | Cache ttl of 300 s | Second key/instance, or a production key |
 | Single process, single VM | A restart or a dead VM is downtime | systemd `Restart=always` | Health check + second instance |
-| No metrics or alerts | Failures are found by users | `/health` + logs | P1 metrics |
+| No alerts on top of the counters | Failures are found by users, unless somebody watches `/metrics` | `/metrics` + `/health` + logs | Alerting rules (P2) |
 | Public challenge endpoint | Memory or CPU abuse | Bounded store, body limit | P0 per-IP limit |
 | Dependency drift | A vulnerable crate ships | Dependabot | `cargo deny` in CI (P1) |
 | `panic = "abort"` | A panic is a restart, not a 500 | No panics on input, tests | Keep the rule |
