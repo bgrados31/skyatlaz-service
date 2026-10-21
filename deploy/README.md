@@ -115,12 +115,23 @@ sudo systemctl reload caddy
 Caddy requests the certificate on the first request, so port 80 has to be open
 before this step.
 
+The `Caddyfile` answers the public `GET /metrics` with `404` on purpose: the
+counters are for you, not for the internet. To scrape them from the host:
+
+```bash
+curl -s http://127.0.0.1:8080/metrics
+```
+
 ## 6. Verify from outside
 
 ```bash
 curl -s https://<your-host>/health
 curl -s https://<your-host>/v1/auth/challenge
 ```
+
+`curl -s -o /dev/null -w '%{http_code}\n' https://<your-host>/metrics` should
+answer `404`: if it answers `200`, the Caddyfile that is running is not the one
+in this repository.
 
 Then point the mod at it: `service_url` in the SkyAtlaz config.
 

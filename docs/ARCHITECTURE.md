@@ -210,11 +210,27 @@ Scaling path, in order, only when needed:
 
 ## 10. Observability
 
-Today: structured logs through `tracing` (one INFO span per request with method,
-path, status and latency), `RUST_LOG` to control verbosity, and `/health` with the
-version, the upstream rate limit state and the number of cached profiles.
+Structured logs through `tracing` (one INFO span per request with method, path,
+status and latency), `RUST_LOG` to control verbosity, `/health` with the version,
+the upstream rate limit state and the number of cached profiles, and `/metrics`
+in the Prometheus text format.
 
-Not yet: metrics, tracing export, alerting. The roadmap has a P1 item for a
-Prometheus text endpoint and a P2 item for OpenTelemetry. Until then, the
-practical signals are `journalctl -u skyatlaz-service`, the Caddy access log and a
-periodic `curl /health`.
+`/metrics` publishes request counts per route and status class, a latency
+histogram per route, cache hits and misses, profile fetches by outcome and the
+retries they needed, and three gauges: the cache size, the request budget of the
+key and what is left of it. Two rules keep it safe: every label value comes from
+a closed set defined in `src/metrics.rs` (`other` for an unknown path) and never
+from a string a caller sent, so the table has a fixed width no client can widen;
+and the counters are plain atomics, so a scrape never takes a lock a request
+needs. A scrape that overlaps a request may therefore see a slightly older value
+for it, which is normal for this kind of endpoint.
+
+The counters are aggregates: no token, no uuid and no player data crosses the
+answer, and `/metrics` is meant to be reachable only from the machine that
+scrapes it — through Caddy, add a rule that refuses it from the internet if the
+service is exposed.
+
+Not yet: tracing export and alerting. The roadmap has P2 items for
+OpenTelemetry. The practical signals are `journalctl -u skyatlaz-service`, the
+Caddy access log, a periodic `curl /health` and a Prometheus scrape of
+`/metrics`.

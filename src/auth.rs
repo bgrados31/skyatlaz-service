@@ -238,7 +238,11 @@ impl AuthService {
         Ok(uuid.to_string())
     }
 
-    fn issue_token(&self, uuid: &Uuid, expires_at: i64) -> String {
+    /// Issues a session token for a player.
+    ///
+    /// Crate visible instead of private so the HTTP tests of the router can hold
+    /// a token without signing a real challenge, which needs RSA key material.
+    pub(crate) fn issue_token(&self, uuid: &Uuid, expires_at: i64) -> String {
         let payload = format!("{uuid}:{expires_at}");
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts keys of any length");
