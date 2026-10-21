@@ -47,6 +47,14 @@ traffic. This file is the source of truth for what is done and what is next; see
 - [x] Container image, `.dockerignore`, MIT licence, `.editorconfig`,
       `.gitattributes`.
 - [x] `AGENTS.md`, `docs/ARCHITECTURE.md`, this file, README updates.
+- [x] Repository material that answers a stranger's questions without asking
+      anybody: README, `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`,
+      `CODE_OF_CONDUCT.md`, issue and pull request templates, a weekly
+      `cargo audit` job and a tag triggered release job.
+- [x] Published privately as `bgrados31/skyatlaz-service`. The history was
+      rewritten before the first push to drop a development
+      `SKYATLAZ_TOKEN_SECRET` that had been committed in an environment
+      template; the value had already been rotated and no deployment used it.
 
 ## Measurements
 
@@ -114,17 +122,24 @@ regression of more than 2× in the cached path is a bug.
    broken JSON or too slowly. *Done when:* a `oneshot` request through the router
    against a fake upstream that sends `not json`, or sleeps past the timeout,
    answers `502`.
-3. **Supply chain job.** `cargo deny check` (licences, advisories, duplicates) on
-   a weekly schedule, separate from the per-PR workflow so a new advisory does
-   not block an unrelated change.
-4. **Prebuilt release artifacts.** A workflow that produces
-   `skyatlaz-service-linux-arm64` plus a checksum on tag, so deploying is a
-   download instead of a 5–10 minute compile on a 1 OCPU VM. This also removes
-   the need for a Rust toolchain in production.
+3. **The rest of the supply chain check.** The weekly job runs `cargo audit` for
+   advisories now. `cargo deny` would add licences and duplicate crates; add it to
+   the same workflow when there is time to triage the first report.
+4. **Prove the release job.** `.github/workflows/release.yml` builds the two musl
+   tarballs, their checksums and the release notes on a `v*` tag, but no tag has
+   been pushed, so nothing has exercised it yet.
+   *Done when:* a tag produces a release with both artifacts, `sha256sum --check`
+   passes on a downloaded one, and the binary runs on a clean VM without a Rust
+   toolchain.
 5. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
    `parse_mining`. Both consume untrusted JSON that changes without notice.
 6. **Split liveness and readiness** if a load balancer is added: `/health` stays
    dependency free, `/ready` can report whether the upstream is usable.
+7. **Turn on private vulnerability reporting if the repository goes public.**
+   `SECURITY.md` points at the Security tab, and GitHub refuses the feature while
+   the repository is private: `PUT .../private-vulnerability-reporting` answers
+   `404`.
+   *Done when:* the advisory form is reachable from a public repository.
 
 ## P2 — later
 
@@ -149,7 +164,7 @@ regression of more than 2× in the cached path is a bug.
 | Single process, single VM | A restart or a dead VM is downtime | systemd `Restart=always` | Health check + second instance |
 | No alerts on top of the counters | Failures are found by users, unless somebody watches `/metrics` | `/metrics` + `/health` + logs | Alerting rules (P2) |
 | Public challenge endpoint | Memory or CPU abuse | Bounded store, body limit | P0 per-IP limit |
-| Dependency drift | A vulnerable crate ships | Dependabot | `cargo deny` in CI (P1) |
+| Dependency drift | A vulnerable crate ships | Dependabot + weekly `cargo audit` | `cargo deny` for licences and duplicates (P1) |
 | `panic = "abort"` | A panic is a restart, not a 500 | No panics on input, tests | Keep the rule |
 
 ## Not planned
