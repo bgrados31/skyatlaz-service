@@ -150,10 +150,15 @@ regression of more than 2× in the cached path is a bug.
    service ever runs more than one process.
 3. **Edition 2024 and a declared MSRV.** Mechanical, but it needs a full matrix
    run; do it in its own commit.
-4. **Token revocation.** Today the only way to invalidate a token is to rotate the
+4. **Move the RustCrypto family with `rsa`.** hmac 0.13, sha1 0.11, sha2 0.11 and
+   digest 0.11 do not build against `rsa` 0.9, which is on `digest` 0.10; the
+   `ignore` rules in `.github/dependabot.yml` keep the bot from proposing the
+   jump until `rsa` moves. base64 0.23 and tower-http 0.7 were checked locally
+   and do compile, so they are left to the bot.
+5. **Token revocation.** Today the only way to invalidate a token is to rotate the
    secret, which invalidates all of them. A short token ttl plus a per-player
    "not before" timestamp would be enough if it is ever needed.
-5. **More endpoints.** Only if the mod needs them, and only with the same rule:
+6. **More endpoints.** Only if the mod needs them, and only with the same rule:
    the token decides which player, never the request.
 
 ## Known risks
