@@ -48,7 +48,7 @@ jobs:
           cat SHA256SUMS
 
       - name: publish
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             skyatlaz-service-x86_64-unknown-linux-musl.tar.gz
