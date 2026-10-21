@@ -29,7 +29,7 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Installs the pinned toolchain and runs `cargo audit`. On failure it opens
       # one issue and keeps updating it instead of failing silently: the advisory
       # is the information, the red badge is not.
