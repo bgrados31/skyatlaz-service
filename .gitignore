@@ -1,0 +1,10 @@
+/target
+.env
+*.log
+
+# IntelliJ
+.idea/
+*.iml
+
+# The index of the code graph (tooling, not part of the project)
+.codebase-memory/

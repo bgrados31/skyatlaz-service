@@ -1,0 +1,31 @@
+[package]
+name = "skyatlaz-service"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted Hypixel API proxy for the SkyAtlaz Minecraft mod"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+dotenvy = "0.15"
+hmac = "0.12"
+rsa = "0.9"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+digest = { version = "0.10", features = ["oid"] }
+uuid = { version = "1", features = ["v4"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
