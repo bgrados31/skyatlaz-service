@@ -22,11 +22,22 @@ traffic. This file is the source of truth for what is done and what is next; see
 - [x] Honest error semantics: `404 profile_not_found`, `503 rate_limited` with
       `Retry-After`, `WWW-Authenticate` on 401, JSON for unknown routes.
 - [x] Hypixel `429` mapped to a wait instead of a bad gateway.
+- [x] Upstream retry: one extra attempt for a `5xx`, a connection that did not
+      open or a timeout, with 200–400 ms of jitter. Never for a `4xx`, a rate
+      limit or a player without a profile, because none of those change on a
+      second look.
+- [x] Tests against a fake upstream on a loopback port, written with `axum`
+      (already a dependency, no mock crate): `429` becomes a wait and is not
+      retried, a `5xx` is tried once more and then reported, a second call that
+      succeeds answers the profile, a `403` and a missing profile are not
+      retried.
 - [x] Graceful shutdown on SIGTERM and Ctrl-C.
 - [x] Structured request logging with method, path, status and latency.
 - [x] `/health` reports the upstream rate limit state and the cache size.
 - [x] HTTP tests through the real router (`oneshot`), contract tests, and unit
-      tests for every new rule: 48 tests, no network.
+      tests for every new rule: 60 tests, no network.
+- [x] One RSA key pair per test binary (`OnceLock`) instead of one per test,
+      which took the suite from about 45 s to under 5 s in a debug build.
 - [x] CI (fmt, clippy `-D warnings`, tests on Linux and Windows, release build),
       pinned toolchain, rustfmt and clippy configuration, Dependabot.
 - [x] Container image, `.dockerignore`, MIT licence, `.editorconfig`,
@@ -99,23 +110,22 @@ regression of more than 2× in the cached path is a bug.
    futures) removes the duplicate without adding state that outlives the request.
    *Done when:* 50 concurrent requests for the same uuid produce one upstream
    call in a test with a mock server.
-3. **Upstream retry policy.** One retry for `5xx` and connection resets, with
-   jitter, never for `4xx`, and never past the request deadline. Today a
-   transient upstream failure is a `502` to the client.
-4. **Mock-server tests.** Add `wiremock` (or a hand-rolled `hyper` server) as a
-   dev dependency and cover: `429` → `503` + `Retry-After`, `5xx` → `502`,
-   malformed JSON → `502`, slow upstream → timeout. The current tests cover the
-   client side of the parsing but not the HTTP mapping.
-5. **Supply chain job.** `cargo deny check` (licences, advisories, duplicates) on
+3. **Malformed and slow upstream, end to end.** The client side is covered: a
+   truncated body is not retried and a bad answer becomes an `ApiError`. What no
+   test does is drive the whole router against an upstream that answers with
+   broken JSON or too slowly. *Done when:* a `oneshot` request through the router
+   against a fake upstream that sends `not json`, or sleeps past the timeout,
+   answers `502`.
+4. **Supply chain job.** `cargo deny check` (licences, advisories, duplicates) on
    a weekly schedule, separate from the per-PR workflow so a new advisory does
    not block an unrelated change.
-6. **Prebuilt release artifacts.** A workflow that produces
+5. **Prebuilt release artifacts.** A workflow that produces
    `skyatlaz-service-linux-arm64` plus a checksum on tag, so deploying is a
    download instead of a 5–10 minute compile on a 1 OCPU VM. This also removes
    the need for a Rust toolchain in production.
-7. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
+6. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
    `parse_mining`. Both consume untrusted JSON that changes without notice.
-8. **Split liveness and readiness** if a load balancer is added: `/health` stays
+7. **Split liveness and readiness** if a load balancer is added: `/health` stays
    dependency free, `/ready` can report whether the upstream is usable.
 
 ## P2 — later
