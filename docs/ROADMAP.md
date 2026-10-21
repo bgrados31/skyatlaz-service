@@ -31,6 +31,17 @@ traffic. This file is the source of truth for what is done and what is next; see
       retried, a `5xx` is tried once more and then reported, a second call that
       succeeds answers the profile, a `403` and a missing profile are not
       retried.
+- [x] Malformed and slow upstream, end to end: requests through the real router
+      with `oneshot`, layers included, against a fake Hypixel on a loopback port.
+      A body that is `not json` and a truncated body answer `502 upstream_error`
+      with a JSON body and are not retried; a valid answer without the player is
+      `404 profile_not_found`, also not retried; an upstream 404 whose body
+      parses is a `502`, because the endpoint is broken and the player is not
+      missing; an upstream that stalls past the client timeout is a `502` after
+      the single retry the client allows; a valid answer still reaches the cache.
+      The timeout is injected in the test build only, so the production 20 s and
+      30 s budgets did not move. `openapi.json` now documents the `502` the
+      handler already returned, with the same `Error` body as the other failures.
 - [x] Graceful shutdown on SIGTERM and Ctrl-C.
 - [x] Structured request logging with method, path, status and latency.
 - [x] `/health` reports the upstream rate limit state and the cache size.
@@ -121,20 +132,14 @@ regression of more than 2× in the cached path is a bug.
    futures) removes the duplicate without adding state that outlives the request.
    *Done when:* 50 concurrent requests for the same uuid produce one upstream
    call in a test with a mock server.
-2. **Malformed and slow upstream, end to end.** The client side is covered: a
-   truncated body is not retried and a bad answer becomes an `ApiError`. What no
-   test does is drive the whole router against an upstream that answers with
-   broken JSON or too slowly. *Done when:* a `oneshot` request through the router
-   against a fake upstream that sends `not json`, or sleeps past the timeout,
-   answers `502`.
-3. **The rest of the supply chain check.** The weekly job runs `cargo audit` for
+2. **The rest of the supply chain check.** The weekly job runs `cargo audit` for
    advisories now. `cargo deny` would add licences and duplicate crates; add it to
    the same workflow when there is time to triage the first report.
-4. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
+3. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
    `parse_mining`. Both consume untrusted JSON that changes without notice.
-5. **Split liveness and readiness** if a load balancer is added: `/health` stays
+4. **Split liveness and readiness** if a load balancer is added: `/health` stays
    dependency free, `/ready` can report whether the upstream is usable.
-6. **Turn on private vulnerability reporting if the repository goes public.**
+5. **Turn on private vulnerability reporting if the repository goes public.**
    `SECURITY.md` points at the Security tab, and GitHub refuses the feature while
    the repository is private: `PUT .../private-vulnerability-reporting` answers
    `404`.
