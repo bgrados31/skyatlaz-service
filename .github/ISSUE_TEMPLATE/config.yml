@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/bgrados31/skyatlaz-service/security/advisories/new
+    about: Report a vulnerability privately. Never in a public issue, and never with a key or a token in it.
+  - name: How the service works
+    url: https://github.com/bgrados31/skyatlaz-service/blob/main/docs/ARCHITECTURE.md
+    about: Design, budgets and failure modes. Many questions are answered here.
+  - name: What is planned
+    url: https://github.com/bgrados31/skyatlaz-service/blob/main/docs/ROADMAP.md
+    about: What is done, what is next, and what is deliberately out of scope.
+  - name: Deploying it
+    url: https://github.com/bgrados31/skyatlaz-service/blob/main/deploy/README.md
+    about: systemd, Caddy, TLS and the checks to run before sharing a url.

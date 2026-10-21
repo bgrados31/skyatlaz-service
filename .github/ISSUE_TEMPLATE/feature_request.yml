@@ -1,0 +1,61 @@
+name: Feature request
+description: A profile field, a behaviour or an operational need this service does not cover.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This service has a deliberately small surface: it answers the profile of
+        the player who authenticates, and nothing else. Requests must not add an
+        account system, a database or a fan-out of the Hypixel key. See the
+        non-goals in README.md and the roadmap in docs/ROADMAP.md.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and where the service gets in the way today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+      description: The behaviour you want, and what the mod would send and receive.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds, other services, or why the mod cannot do it on its own.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: contract
+    attributes:
+      label: Does this change the contract?
+      description: A new field, status code or header in openapi.json affects the mod and needs a commit on both sides.
+      options:
+        - "No, it is internal"
+        - "Yes, it changes /v1/profile or an existing answer"
+        - "Yes, it adds an endpoint"
+        - "I do not know"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: memory
+    attributes:
+      label: Does it need to remember something?
+      description: Anything remembered per player, per address or per token has to have a cap.
+      options:
+        - "No, it is stateless"
+        - "Yes, bounded by configuration"
+        - "Yes, and I do not know the bound"
+    validations:
+      required: true
