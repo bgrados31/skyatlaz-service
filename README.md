@@ -141,6 +141,9 @@ tests need no network and no key: the Hypixel answers are fixtures.
 - The raw Hypixel profile is around a megabyte. Only the mining tree, the dungeon
   statistics and the currencies are kept, the rest is dropped before the answer is cached.
 - Never commit the developer key. Keep it in the environment of the process.
+- `/v1/auth/challenge` allows 30 requests per minute per address. Behind a local
+  proxy (the Caddy setup in `deploy/`) the address is the last `X-Forwarded-For`
+  entry; from anywhere else the socket address wins and the header is ignored.
 - Requests are logged with method, path, status and latency; tokens, keys and
   signatures never reach the logs.
 - The process finishes the open requests and exits on SIGTERM, which is what

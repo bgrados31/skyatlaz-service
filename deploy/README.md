@@ -126,10 +126,24 @@ Then point the mod at it: `service_url` in the SkyAtlaz config.
 
 ## 7. Before you share the URL
 
-`GET /v1/auth/challenge` is unauthenticated and stores one nonce per call for
-300 seconds. On localhost that is irrelevant; on a public address it is a memory
-exhaustion vector. Add a per-IP rate limit in Caddy, or bound the map in
-`auth.rs`, before announcing the service.
+The service bounds its own memory and its own abuse surface:
+
+- at most 10 000 live nonces (`MAX_CHALLENGES`), each one single use;
+- at most 30 challenges per minute per address, answered with `429` and
+  `Retry-After: 60`;
+- at most 10 000 tracked addresses.
+
+Behind Caddy the connections arrive from loopback, so the limit keys on the last
+`X-Forwarded-For` entry, which Caddy sets by default. From any other peer the
+socket address wins and the header is ignored, so a client cannot pick its own
+bucket.
+
+What is left is a distributed flood: thousands of addresses that each stay under
+their own 30 per minute. Close that at the edge. Stock Caddy has no rate limit
+directive, so build the binary with the `caddy-ratelimit` module
+(`xcaddy build --with github.com/mholt/caddy-ratelimit`), add a zone keyed on the
+remote host, and check the module's README for the current directive syntax
+before editing the `Caddyfile`.
 
 ## Maintenance
 
