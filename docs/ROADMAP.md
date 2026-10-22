@@ -26,6 +26,13 @@ traffic. This file is the source of truth for what is done and what is next; see
       open or a timeout, with 200–400 ms of jitter. Never for a `4xx`, a rate
       limit or a player without a profile, because none of those change on a
       second look.
+- [x] Single-flight on cache misses: concurrent requests for one uuid share one
+      upstream call, success or failure, through a bounded table of weak flights.
+      A finished flight removes its entry, a cancelled one is dropped by the next
+      lookup and cannot wedge the uuid. No new dependency: the change only turns
+      on the `sync` feature of the `tokio` already in the tree. Fifty concurrent
+      requests for one player produce one upstream call in a test with a fake
+      upstream.
 - [x] Tests against a fake upstream on a loopback port, written with `axum`
       (already a dependency, no mock crate): `429` becomes a wait and is not
       retried, a `5xx` is tried once more and then reported, a second call that
@@ -39,7 +46,7 @@ traffic. This file is the source of truth for what is done and what is next; see
       fetches by outcome, retries, and three gauges. Fixed label sets, atomics
       only, no new dependency, and refused from the internet in the Caddyfile.
 - [x] HTTP tests through the real router (`oneshot`), contract tests, and unit
-      tests for every new rule: 69 tests, no network.
+      tests for every new rule: 76 tests, no network.
 - [x] One RSA key pair per test binary (`OnceLock`) instead of one per test,
       which took the suite from about 45 s to under 5 s in a debug build.
 - [x] CI (fmt, clippy `-D warnings`, tests on Linux and Windows, release build),
@@ -116,25 +123,20 @@ regression of more than 2× in the cached path is a bug.
 
 ## P1 — next round
 
-1. **Single-flight on cache misses.** Two concurrent requests for the same player
-   both call Hypixel. A per-uuid async lock (or a `DashMap` of in-flight
-   futures) removes the duplicate without adding state that outlives the request.
-   *Done when:* 50 concurrent requests for the same uuid produce one upstream
-   call in a test with a mock server.
-2. **Malformed and slow upstream, end to end.** The client side is covered: a
+1. **Malformed and slow upstream, end to end.** The client side is covered: a
    truncated body is not retried and a bad answer becomes an `ApiError`. What no
    test does is drive the whole router against an upstream that answers with
    broken JSON or too slowly. *Done when:* a `oneshot` request through the router
    against a fake upstream that sends `not json`, or sleeps past the timeout,
    answers `502`.
-3. **The rest of the supply chain check.** The weekly job runs `cargo audit` for
+2. **The rest of the supply chain check.** The weekly job runs `cargo audit` for
    advisories now. `cargo deny` would add licences and duplicate crates; add it to
    the same workflow when there is time to triage the first report.
-4. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
+3. **Fuzz the parser.** `cargo-fuzz` targets for `parse_profile` and
    `parse_mining`. Both consume untrusted JSON that changes without notice.
-5. **Split liveness and readiness** if a load balancer is added: `/health` stays
+4. **Split liveness and readiness** if a load balancer is added: `/health` stays
    dependency free, `/ready` can report whether the upstream is usable.
-6. **Turn on private vulnerability reporting if the repository goes public.**
+5. **Turn on private vulnerability reporting if the repository goes public.**
    `SECURITY.md` points at the Security tab, and GitHub refuses the feature while
    the repository is private: `PUT .../private-vulnerability-reporting` answers
    `404`.

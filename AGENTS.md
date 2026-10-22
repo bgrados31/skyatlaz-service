@@ -27,6 +27,7 @@ Non-goals, by design:
 | `src/hypixel.rs` | Upstream client, rate limit headers, slim profile parsing. |
 | `src/ratelimit.rs` | What the key's rate limit window currently allows. |
 | `src/cache.rs` | Bounded TTL cache (LRU eviction) of slim profiles. |
+| `src/singleflight.rs` | Coalesces concurrent cache misses for one player into one upstream call. |
 | `src/config.rs` | Environment parsing and validation; fails fast on bad values. |
 | `openapi.json` | The public contract. Embedded at compile time, served at `/openapi.json`. |
 | `deploy/` | systemd unit, Caddyfile, environment template, Oracle runbook. |

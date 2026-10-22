@@ -45,6 +45,7 @@ from that proof. There is no request shape that reads somebody else's profile.
 | `hypixel` | `reqwest::Client`, `RateLimits` | Upstream call, rate limit header bookkeeping, parsing to `SlimProfile`. |
 | `ratelimit` | `Mutex<State>` | Remaining quota and when the window resets, so the service can refuse early. |
 | `cache` | `Mutex<State<K, V>>` | Bounded TTL cache with LRU eviction. |
+| `singleflight` | `Mutex<HashMap<uuid, Weak<Flight>>>` | One upstream call per player at a time; the concurrent misses wait for its result. |
 
 There is no database and no external cache. Every piece of state is in this
 process and is rebuilt on restart, which is the point: a restart costs tokens and
@@ -83,17 +84,25 @@ which is what makes a restart cheap and a second instance possible later.
 checks the expiry, and takes the uuid **from the token**. Then:
 
 1. A cache hit returns the slim profile immediately.
-2. A miss asks Hypixel. Before the call, the service refuses if the rate limit
-   window is known to be exhausted; after the call it records the
-   `RateLimit-*` headers. A `429` becomes `RateLimited(wait)`.
-3. A transient failure is tried once more, after 200–400 ms of jitter: a `5xx`,
+2. A miss joins the single flight of the uuid. The first request leads and asks
+   Hypixel; any request that arrives while that call is in progress waits for its
+   result, success or failure, so a player costs one upstream call however many
+   clients poll at once. The leader looks in the cache once more before calling,
+   because a flight that ended between the miss and that point has already stored
+   the profile.
+3. Before the call, the service refuses if the rate limit window is known to be
+   exhausted; after the call it records the `RateLimit-*` headers. A `429`
+   becomes `RateLimited(wait)`.
+4. A transient failure is tried once more, after 200–400 ms of jitter: a `5xx`,
    a connection that did not open, a request that did not go out, a timeout. A
    second look would not change a `4xx`, a used up rate limit or a player without
    a profile, so those are returned at once. The whole upstream call, both
    attempts included, is bounded by the 20 s upstream timeout and the 30 s
    request timeout; a retry after a timeout can therefore be cut short by the
    latter.
-4. The response is parsed into `SlimProfile` and cached under the uuid.
+5. The response is parsed into `SlimProfile` and cached under the uuid, still
+   inside the flight, so the requests waiting for it and the next caller find the
+   value.
 
 The raw upstream profile is about a megabyte. Only the mining tree, dungeons and
 currencies survive parsing; everything else is dropped before the value reaches
@@ -102,14 +111,30 @@ the cache.
 ## 4. Concurrency and state
 
 - Tokio multi-thread runtime; handlers are async and never block.
-- All shared state uses `std::sync::Mutex` for very short critical sections and
-  no guard is held across an `.await`. The upstream call happens with no lock
-  held, which is why two requests for the same player can both miss the cache.
-  That is accepted: the mod polls one player, and the cache TTL makes a duplicate
-  call rare. See the roadmap for single-flight if the traffic ever justifies it.
-- The cache and the nonce store are the only structures that grow with traffic,
-  and both have hard caps. Memory is a function of the caps, not of the request
-  rate.
+- The long-lived shared state (`TtlCache`, `Challenges`, `RateLimits`) uses
+  `std::sync::Mutex` for very short critical sections, and none of those guards is
+  held across an `.await`.
+- A cache miss goes through `singleflight`, which does hold a `tokio::sync::Mutex`
+  guard across the upstream call: that is what makes the waiters wait, and it is
+  the async mutex because a task has to await on it. The table of flights itself
+  is a `std::sync::Mutex<HashMap<uuid, Weak<Flight>>>`; the lock is taken only to
+  find or register a flight, never across an await, and the entries are weak, so a
+  flight only stays in the table while a request is waiting on it: a finished
+  flight removes its own entry, and the next lookup drops the entries that a
+  cancelled or timed-out flight left behind. A leader cancelled by the request
+  timeout drops its guard, one waiter takes over and the uuid is not wedged. If
+  the upstream itself hangs, that happens once per waiter: each takeover starts a
+  fresh call until the waiter's own request timeout ends it too, so the calls stay
+  sequential and nobody is answered from a flight that is already gone. The
+  table is capped at `MAX_IN_FLIGHT_PROFILES` (1 024); past the cap a request
+  fetches on its own instead of evicting a flight somebody is waiting on, so the
+  bound costs coalescing and never correctness.
+- The result, not just the success, is shared: a failure is not retried once per
+  waiter. The profile is cached before the flight is released, so a request that
+  arrives after the flight is a cache hit.
+- The cache, the nonce store and the flight table are the only structures that
+  grow with traffic, and all three have hard caps. Memory is a function of the
+  caps, not of the request rate.
 
 ## 5. Budgets and capacity
 
@@ -119,6 +144,7 @@ the cache.
 | Profile TTL | 300 s → at most 12 requests per player per hour | ~120 players (at 120/5 min) to ~300 players (at 300/5 min) can be served continuously by one key. |
 | Cache | 1 024 entries by default, 100 000 hard cap | Tens of megabytes at the default. |
 | Nonce store | 10 000 entries | 10 000 × (nonce + timestamp) is a few megabytes. |
+| In-flight profile calls | 1 024 uuids, weak entries | One entry per player with a call in progress; a finished flight removes itself and the next lookup drops a cancelled one. |
 | Challenge rate | 30 per address per minute, 10 000 addresses tracked | One address cannot flood the endpoint; the map of addresses is capped. |
 | Request body | 64 KiB | A verify request is about 1 KiB; the margin is deliberate. |
 | Upstream timeout | 20 s | Bounds a stuck Hypixel connection. |
@@ -207,6 +233,7 @@ Scaling path, in order, only when needed:
 | `rustls` | No OpenSSL on the host, one less thing to patch. | `native-tls`. |
 | `panic = "abort"`, `opt-level = "z"` | Small binary, fast deploy to a small VM; no unwinding to catch. | `panic = "unwind"`: bigger binary, unused. |
 | Oracle Always Free + Caddy | Zero cost and automatic certificates. | PaaS with a card requirement. |
+| Single-flight with a bounded weak table and `tokio::sync::Mutex` | Removes the duplicate upstream call without a new dependency, shares failures too, and a cancelled leader cannot wedge a uuid. | `DashMap` of in-flight futures: another dependency and a table still needs its own bound. |
 
 ## 10. Observability
 
@@ -229,6 +256,12 @@ The counters are aggregates: no token, no uuid and no player data crosses the
 answer, and `/metrics` is meant to be reachable only from the machine that
 scrapes it — through Caddy, add a rule that refuses it from the internet if the
 service is exposed.
+
+Cache misses count every request the cache could not answer, while the fetch
+counters count upstream calls, which single-flight shares. The gap between a
+burst of misses and the one fetch that answered it is what coalescing saved;
+`/health` and `/metrics` do not expose the flight table because its size is
+per-request state, not a number worth alerting on.
 
 Not yet: tracing export and alerting. The roadmap has P2 items for
 OpenTelemetry. The practical signals are `journalctl -u skyatlaz-service`, the
